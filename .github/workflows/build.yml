@@ -24,6 +24,12 @@ jobs:
           echo "=> KDIR: $KDIR"
           
           # 移除 6.6 内核下不支持的函数调用
+                    export KDIR="/opt/ddk/kdir/android15-6.6"
+          sed -i 's/^VERSION = .*/VERSION = 6/' $KDIR/Makefile
+          sed -i 's/^PATCHLEVEL = .*/PATCHLEVEL = 6/' $KDIR/Makefile
+          sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 118/' $KDIR/Makefile
+          sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android15-11/' $KDIR/Makefile
+          echo "" > $KDIR/scripts/setlocalversion
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
           echo "=> Compiling module..."
