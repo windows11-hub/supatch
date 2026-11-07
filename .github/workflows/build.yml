@@ -34,7 +34,8 @@ jobs:
           # 2. 动态查找 DDK 容器内的 Clang 路径
           REAL_CLANG_BIN=$(find /opt/ddk/clang -name "clang" -type f | head -n 1 | xargs dirname)
           echo "Found real clang bin path: $REAL_CLANG_BIN"
-          
+          cp build/build.sh build/build.sh.bak
+          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
           if [ -z "$REAL_CLANG_BIN" ]; then
             echo "ERROR: Could not find clang in /opt/ddk"
             exit 1
