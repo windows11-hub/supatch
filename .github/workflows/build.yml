@@ -22,15 +22,13 @@ jobs:
         run: |
           set -e
           echo "=> KDIR: $KDIR"
+
+          # 1. 在源码里强行注入 MODULE_INFO (如果源码没改的话)
+          if ! grep -q 'MODULE_INFO(vermagic' src/kpm_host_core.c; then
+            sed -i '/MODULE_LICENSE("GPL v2");/a MODULE_INFO(vermagic, "6.6.118-android15-11 SMP preempt mod_unload modversions aarch64");' src/kpm_host_core.c
+          fi
           
-          # 1. 强行修改 DDK 源码树的版本号宏
-          sed -i 's/^VERSION = .*/VERSION = 6/' $KDIR/Makefile
-          sed -i 's/^PATCHLEVEL = .*/PATCHLEVEL = 6/' $KDIR/Makefile
-          sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 118/' $KDIR/Makefile
-          sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android15-11/' $KDIR/Makefile
-          echo "" > $KDIR/scripts/setlocalversion
-          
-          # 2. 删除 6.6 不支持的调用
+          # 2. 移除源码里不支持的 6.6 CFI 调用
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
           # 3. 编译模块
@@ -54,16 +52,7 @@ jobs:
             exit 1
           fi
 
-          # 5. 二进制强改 Vermagic（纯 sed，无 Python 缩进烦恼）
-          echo "=> Patching binary vermagic..."
-          OLD_VER="6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64"
-          NEW_VER="6.6.118-android15-11 SMP preempt mod_unload modversions aarch64"
-          
-          # 由于 sed 替换长度必须一致，这里用 \0 补齐（注意这里不破坏 ELF 结构）
-          PAD=$(printf '%*s' $((${#OLD_VER} - ${#NEW_VER})) | tr ' ' '\0')
-          sed -i -b "s/$OLD_VER/$NEW_VER$PAD/g" build/kpm_host-gki-6.6.ko
-
-          # 6. 输出体检信息
+          # 5. 输出体检信息
           echo ""
           echo "=================================================="
           echo "                 LKM VERIFICATION"
