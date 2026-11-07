@@ -784,4 +784,133 @@ __kpm_nocfi long kpm_load_module(const void *data, unsigned long len, const char
 		host_set_memory_x((unsigned long)img->base,
 				  DIV_ROUND_UP(img->size, PAGE_SIZE));
 
-	if (!img->
+	if (!img->init)
+		goto out;
+	pr_alert("kpm: l8 call kpm init at %px\n", img->init);
+
+	{
+		int cret = kpm_cfi_register((unsigned long)img->base, img->size);
+		if (cret)
+			pr_warn("kpm: cfi shadow register failed rc=%d\n", cret);
+	}
+
+	kpm_cfi_neuter_slowpath();
+
+	init_fn = *(kpm_initcall_t *)img->init;
+	pr_alert("kpm: init_fn addr=%px event=%s\n", (void *)init_fn, event ?: "");
+	rc = init_fn(args, event, reserved);
+	pr_alert("kpm: l9 kpm init rc=%ld\n", rc);
+
+	if (!rc) {
+		pr_alert("kpm: [%s] succeed\n", img->info_name ?: "?");
+		img->loaded = true;
+	} else {
+		pr_err("kpm: [%s] failed rc=%ld, try exit ...\n",
+		       img->info_name ?: "?", rc);
+		if (img->exit) {
+			kpm_exitcall_t exit_fn = *(kpm_exitcall_t *)img->exit;
+			exit_fn(reserved);
+		}
+	}
+
+	if (rc) {
+		if (host_set_memory_rw)
+			host_set_memory_rw((unsigned long)img->base,
+					   DIV_ROUND_UP(img->size, PAGE_SIZE));
+		host_module_memfree(img->base);
+	}
+
+out:
+	if (!img->loaded)
+		kpm_cfi_restore_slowpath();
+	return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* module lifecycle                                                    */
+/* ------------------------------------------------------------------ */
+
+static int __kpm_nocfi kpm_host_do_init(void)
+{
+	int rc;
+
+	pr_alert("kpm: host init (agent mode)\n");
+
+	kpm_live_parse(kpm_syms);
+
+	kallsyms_lookup_name_fn =
+		(unsigned long (*)(const char *))kpm_live_find("kallsyms_lookup_name");
+	if (!kallsyms_lookup_name_fn) {
+		pr_err("kpm: live table has no kallsyms_lookup_name entry, refusing\n");
+		return -EINVAL;
+	}
+	pr_alert("kpm: t1 anchor kallsyms_lookup_name=%px\n", (void *)kallsyms_lookup_name_fn);
+
+	resolve_exec_alloc();
+	resolve_cfi_shadow();
+	resolve_kpm_syms();
+	pr_alert("kpm: t2 module_alloc=%px module_memfree=%px printk=%px copy_to_user=%px\n",
+		host_module_alloc, host_module_memfree, host_printk, host_copy_to_user);
+
+	if (!host_module_alloc || !host_module_memfree) {
+		pr_err("kpm: module_alloc/module_memfree unresolved, refusing\n");
+		return -ENOSYS;
+	}
+
+	rc = kpm_ctl_init();
+	if (rc)
+		return rc;
+
+	pr_alert("kpm: host ready. push .kpm as memory via ioctl(LOAD) on /dev/suzhi_loader\n");
+	return 0;
+}
+
+static int __init kpm_host_init(void)
+{
+	return kpm_host_do_init();
+}
+
+void __kpm_nocfi kpm_unload_current(void)
+{
+	if (!kpm_image.loaded && !kpm_image.base)
+		return;
+
+	pr_alert("kpm: unload current image\n");
+	if (kpm_image.loaded && kpm_image.exit) {
+		kpm_exitcall_t exit_fn = *(kpm_exitcall_t *)kpm_image.exit;
+		exit_fn(NULL);
+		kpm_image.loaded = false;
+	}
+	if (kpm_image.base)
+		kpm_cfi_unregister();
+	kpm_cfi_restore_slowpath();
+	if (kpm_image.base) {
+		if (host_set_memory_rw)
+			host_set_memory_rw((unsigned long)kpm_image.base,
+					   DIV_ROUND_UP(kpm_image.size, PAGE_SIZE));
+		host_module_memfree(kpm_image.base);
+	}
+	memset(&kpm_image, 0, sizeof(kpm_image));
+}
+
+int kpm_is_loaded(void)
+{
+	return kpm_image.loaded ? 1 : 0;
+}
+
+static void __kpm_nocfi kpm_host_do_exit(void)
+{
+	pr_alert("kpm: host exit\n");
+	kpm_unload_current();
+	kpm_ctl_exit();
+	kpm_live_free();
+	pr_alert("kpm: host exit done\n");
+}
+
+static void __exit kpm_host_exit(void)
+{
+	kpm_host_do_exit();
+}
+
+module_init(kpm_host_init);
+module_exit(kpm_host_exit);
