@@ -1,0 +1,68 @@
+name: Build KPM Host Agent (GKI 6.6)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  workflow_dispatch: # 允许你在 Actions 页面手动点击运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      # 直接使用 DDK 官方提供的 6.6 容器环境，省去装 Clang 和内核树的麻烦
+      image: ghcr.io/ylarod/ddk-min:android15-6.6
+      options: --privileged
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show DDK Environment Info
+        run: |
+          echo "Kernel version in DDK:"
+          ls -la /sys/kernel 2>/dev/null || true
+          clang --version
+
+      - name: Build kpm_host.ko (GKI 6.6)
+        run: |
+          chmod +x build/build.sh
+          # 将 DDK 的内核源码路径传入脚本
+          # 注意：具体 KDIR 路径可能需要根据 DDK 镜像内部的实际情况微调
+          # 常见的 GKI 源码路径通常在 /lib/modules/$(uname -r)/build 或者 /ddk/kernel
+          export KDIR="/ddk/kernel"
+          if [ ! -d "$KDIR" ]; then
+            echo "Warning: $KDIR not found. Trying alternative path."
+            export KDIR=$(find / -name "Makefile" -path "*/linux-*" | head -n 1 | xargs dirname)
+          fi
+          echo "Using KDIR: $KDIR"
+          
+          # 执行编译脚本，假设产物输出在 build/ 目录
+          # 如果脚本需要特定参数，请根据实际情况调整
+          bash build/build.sh
+          
+          # 防止脚本命名不带 6.6，强制重命名以便区分
+          if [ -f "build/kpm_host.ko" ]; then
+            mv build/kpm_host.ko build/kpm_host-gki-6.6.ko
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpm_host-gki-6.6
+          path: |
+            build/kpm_host-gki-6.6.ko
+            helper/suzhi_loader_arm64
+            helper/suzhi_loader
+          # 如果找不到匹配的文件，也不要让 workflow 报错
+          if-no-files-found: warn
+
+      - name: Create Release (Optional)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/kpm_host-gki-6.6.ko
+            helper/suzhi_loader_arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
