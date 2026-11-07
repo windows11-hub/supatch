@@ -23,15 +23,17 @@ jobs:
           set -e
           echo "=> KDIR: $KDIR"
           
-          # 移除 6.6 内核下不支持的函数调用
-                    export KDIR="/opt/ddk/kdir/android15-6.6"
+          # 1. 修改内核源码树的版本号，强制生成 6.6.118
           sed -i 's/^VERSION = .*/VERSION = 6/' $KDIR/Makefile
           sed -i 's/^PATCHLEVEL = .*/PATCHLEVEL = 6/' $KDIR/Makefile
           sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 118/' $KDIR/Makefile
           sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android15-11/' $KDIR/Makefile
           echo "" > $KDIR/scripts/setlocalversion
+          
+          # 2. 移除源码里不支持的 6.6 CFI 调用（如有）
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
+          # 3. 编译模块
           echo "=> Compiling module..."
           make -C "$KDIR" \
             M="$PWD/src" \
@@ -41,17 +43,44 @@ jobs:
             CC=clang \
             KCFLAGS="-ffixed-x18 -Wno-format" \
             modules
-            
+
+          # 4. 处理产物
           echo "=> Handling output..."
           mkdir -p build
           if [ -f "src/kpm_host.ko" ]; then
             mv src/kpm_host.ko build/kpm_host-gki-6.6.ko
-            echo "=> Moved to build/kpm_host-gki-6.6.ko"
           else
             echo "=> ERROR: kpm_host.ko not found in src/"
             exit 1
           fi
-          
+
+          # 5. 二进制强改 Vermagic（干掉所有残留的旧版本号）
+          echo "=> Patching binary vermagic..."
+          python3 -c "
+import sys
+ko_path = 'build/kpm_host-gki-6.6.ko'
+with open(ko_path, 'rb') as f:
+    data = f.read()
+
+# 寻找可能存在的旧 vermagic 字符串并替换
+old_strs = [
+    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64',
+    b'6.6.127 SMP preempt mod_unload modversions aarch64'
+]
+new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'
+
+for old_str in old_strs:
+    if old_str in data:
+        pad_len = len(old_str) - len(new_str)
+        patched_str = new_str + b'\x00' * pad_len
+        data = data.replace(old_str, patched_str)
+        print(f'=> Replaced old vermagic: {old_str.decode()}')
+
+with open(ko_path, 'wb') as f:
+    f.write(data)
+"
+
+          # 6. 输出体检信息
           echo ""
           echo "=================================================="
           echo "                 LKM VERIFICATION"
@@ -59,7 +88,7 @@ jobs:
           echo "Vermagic:"
           modinfo -F vermagic build/kpm_host-gki-6.6.ko
           echo ""
-          echo "Sections (.modinfo and .versions):"
+          echo "Sections:"
           readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
           echo ""
           echo "SHA256:"
@@ -72,3 +101,4 @@ jobs:
           name: kpm_host-gki-6.6
           path: build/kpm_host-gki-6.6.ko
           if-no-files-found: error
+          
