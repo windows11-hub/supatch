@@ -22,16 +22,11 @@ jobs:
         run: |
           set -e
           echo "=> KDIR: $KDIR"
-
-          # 1. 在源码里强行注入 MODULE_INFO (如果源码没改的话)
-          if ! grep -q 'MODULE_INFO(vermagic' src/kpm_host_core.c; then
-            sed -i '/MODULE_LICENSE("GPL v2");/a MODULE_INFO(vermagic, "6.6.118-android15-11 SMP preempt mod_unload modversions aarch64");' src/kpm_host_core.c
-          fi
           
-          # 2. 移除源码里不支持的 6.6 CFI 调用
+          # 1. 移除源码里不支持的 6.6 CFI 调用
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
-          # 3. 编译模块
+          # 2. 编译模块
           echo "=> Compiling module..."
           make -C "$KDIR" \
             M="$PWD/src" \
@@ -42,7 +37,7 @@ jobs:
             KCFLAGS="-ffixed-x18 -Wno-format" \
             modules
 
-          # 4. 处理产物
+          # 3. 处理产物
           echo "=> Handling output..."
           mkdir -p build
           if [ -f "src/kpm_host.ko" ]; then
@@ -51,6 +46,42 @@ jobs:
             echo "=> ERROR: kpm_host.ko not found in src/"
             exit 1
           fi
+
+          # 4. 用 Python 脚本在二进制层面强制替换 vermagic
+          echo "=> Patching binary vermagic..."
+          cat << 'EOF' > /tmp/patch_ko.py
+import sys
+
+ko_path = 'build/kpm_host-gki-6.6.ko'
+with open(ko_path, 'rb') as f:
+    data = f.read()
+
+# 匹配 DDK 可能生成的所有 6.6.127 变体
+old_vers = [
+    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64',
+    b'6.6.127 SMP preempt mod_unload modversions aarch64'
+]
+new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'
+
+patched = False
+for old_str in old_vers:
+    if old_str in data:
+        # 用空字节补齐，保证长度完全一致
+        pad_len = len(old_str) - len(new_str)
+        replace_str = new_str + (b'\x00' * pad_len)
+        data = data.replace(old_str, replace_str)
+        patched = True
+        print(f'==> Patched string: {old_str.decode()}')
+
+if patched:
+    with open(ko_path, 'wb') as f:
+        f.write(data)
+    print('==> Successfully patched file.')
+else:
+    print('==> Warning: old vermagic not found. Compiler may already use correct one.')
+EOF
+
+          python3 /tmp/patch_ko.py
 
           # 5. 输出体检信息
           echo ""
