@@ -23,14 +23,14 @@ jobs:
           set -e
           echo "=> KDIR: $KDIR"
           
-          # 1. 修改内核源码树的版本号，强制生成 6.6.118
+          # 1. 强行修改 DDK 源码树的版本号宏
           sed -i 's/^VERSION = .*/VERSION = 6/' $KDIR/Makefile
           sed -i 's/^PATCHLEVEL = .*/PATCHLEVEL = 6/' $KDIR/Makefile
           sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 118/' $KDIR/Makefile
           sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android15-11/' $KDIR/Makefile
           echo "" > $KDIR/scripts/setlocalversion
           
-          # 2. 移除源码里不支持的 6.6 CFI 调用（如有）
+          # 2. 删除 6.6 不支持的调用
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
           # 3. 编译模块
@@ -54,31 +54,14 @@ jobs:
             exit 1
           fi
 
-          # 5. 二进制强改 Vermagic（干掉所有残留的旧版本号）
+          # 5. 二进制强改 Vermagic（纯 sed，无 Python 缩进烦恼）
           echo "=> Patching binary vermagic..."
-          python3 -c "
-import sys
-ko_path = 'build/kpm_host-gki-6.6.ko'
-with open(ko_path, 'rb') as f:
-    data = f.read()
-
-# 寻找可能存在的旧 vermagic 字符串并替换
-old_strs = [
-    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64',
-    b'6.6.127 SMP preempt mod_unload modversions aarch64'
-]
-new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'
-
-for old_str in old_strs:
-    if old_str in data:
-        pad_len = len(old_str) - len(new_str)
-        patched_str = new_str + b'\x00' * pad_len
-        data = data.replace(old_str, patched_str)
-        print(f'=> Replaced old vermagic: {old_str.decode()}')
-
-with open(ko_path, 'wb') as f:
-    f.write(data)
-"
+          OLD_VER="6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64"
+          NEW_VER="6.6.118-android15-11 SMP preempt mod_unload modversions aarch64"
+          
+          # 由于 sed 替换长度必须一致，这里用 \0 补齐（注意这里不破坏 ELF 结构）
+          PAD=$(printf '%*s' $((${#OLD_VER} - ${#NEW_VER})) | tr ' ' '\0')
+          sed -i -b "s/$OLD_VER/$NEW_VER$PAD/g" build/kpm_host-gki-6.6.ko
 
           # 6. 输出体检信息
           echo ""
@@ -101,4 +84,3 @@ with open(ko_path, 'wb') as f:
           name: kpm_host-gki-6.6
           path: build/kpm_host-gki-6.6.ko
           if-no-files-found: error
-          
