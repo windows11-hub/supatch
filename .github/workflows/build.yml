@@ -47,43 +47,36 @@ jobs:
             exit 1
           fi
 
-          # 4. 用 Python 脚本在二进制层面强制替换 vermagic
+          # 4. 用 echo 生成 Python 脚本（每行独立，绝无缩进错误）
+          echo "import sys" > /tmp/patch_ko.py
+          echo "ko_path = 'build/kpm_host-gki-6.6.ko'" >> /tmp/patch_ko.py
+          echo "with open(ko_path, 'rb') as f:" >> /tmp/patch_ko.py
+          echo "    data = f.read()" >> /tmp/patch_ko.py
+          echo "old_vers = [" >> /tmp/patch_ko.py
+          echo "    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64'," >> /tmp/patch_ko.py
+          echo "    b'6.6.127 SMP preempt mod_unload modversions aarch64'" >> /tmp/patch_ko.py
+          echo "]" >> /tmp/patch_ko.py
+          echo "new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'" >> /tmp/patch_ko.py
+          echo "patched = False" >> /tmp/patch_ko.py
+          echo "for old_str in old_vers:" >> /tmp/patch_ko.py
+          echo "    if old_str in data:" >> /tmp/patch_ko.py
+          echo "        pad_len = len(old_str) - len(new_str)" >> /tmp/patch_ko.py
+          echo "        replace_str = new_str + (b'\x00' * pad_len)" >> /tmp/patch_ko.py
+          echo "        data = data.replace(old_str, replace_str)" >> /tmp/patch_ko.py
+          echo "        patched = True" >> /tmp/patch_ko.py
+          echo "        print('==> Patched string: ' + old_str.decode())" >> /tmp/patch_ko.py
+          echo "if patched:" >> /tmp/patch_ko.py
+          echo "    with open(ko_path, 'wb') as f:" >> /tmp/patch_ko.py
+          echo "        f.write(data)" >> /tmp/patch_ko.py
+          echo "    print('==> Successfully patched file.')" >> /tmp/patch_ko.py
+          echo "else:" >> /tmp/patch_ko.py
+          echo "    print('==> Warning: old vermagic not found.')" >> /tmp/patch_ko.py
+
+          # 5. 手动执行 Python 脚本
           echo "=> Patching binary vermagic..."
-          cat << 'EOF' > /tmp/patch_ko.py
-import sys
-
-ko_path = 'build/kpm_host-gki-6.6.ko'
-with open(ko_path, 'rb') as f:
-    data = f.read()
-
-# 匹配 DDK 可能生成的所有 6.6.127 变体
-old_vers = [
-    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64',
-    b'6.6.127 SMP preempt mod_unload modversions aarch64'
-]
-new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'
-
-patched = False
-for old_str in old_vers:
-    if old_str in data:
-        # 用空字节补齐，保证长度完全一致
-        pad_len = len(old_str) - len(new_str)
-        replace_str = new_str + (b'\x00' * pad_len)
-        data = data.replace(old_str, replace_str)
-        patched = True
-        print(f'==> Patched string: {old_str.decode()}')
-
-if patched:
-    with open(ko_path, 'wb') as f:
-        f.write(data)
-    print('==> Successfully patched file.')
-else:
-    print('==> Warning: old vermagic not found. Compiler may already use correct one.')
-EOF
-
           python3 /tmp/patch_ko.py
 
-          # 5. 输出体检信息
+          # 6. 输出体检信息
           echo ""
           echo "=================================================="
           echo "                 LKM VERIFICATION"
