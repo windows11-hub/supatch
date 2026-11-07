@@ -2,7 +2,7 @@
 /*
  * kpm_host.c - resident KPM loader agent (LKM) for pure Magisk / temp-root.
  */
-
+MODULE_INFO(vermagic, "6.6.118-android15-11 SMP preempt mod_unload modversions aarch64");
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
