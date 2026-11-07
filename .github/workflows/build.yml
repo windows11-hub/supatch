@@ -43,7 +43,14 @@ jobs:
           cp build/build.sh build/build.sh.bak
           
           # 1. 修正 Clang 路径（完整版镜像里一般在 /usr/bin 或通过环境变量调用）
-          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=/usr/bin|g" build/build.sh
+          # 探测 DDK 镜像里真实的 LLVM 工具链路径
+          REAL_CLANG_BIN=$(find / -name "llvm-objcopy" -type f 2>/dev/null | head -n 1 | xargs dirname)
+          echo "Found LLVM tools at: $REAL_CLANG_BIN"
+          if [ -z "$REAL_CLANG_BIN" ]; then
+            echo "ERROR: llvm-objcopy not found!"
+            exit 1
+          fi
+          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
           
           # 2. 修正源码路径（源码在 src/ 目录下）
           sed -i 's|M="$HERE"|M="$HERE/../src"|g' build/build.sh
