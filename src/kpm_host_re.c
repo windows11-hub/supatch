@@ -128,16 +128,13 @@ int kpm_apply_relocate_add(Elf64_Shdr *sechdrs, const char *strtab, unsigned int
 	u64 val;
 	Elf64_Rela *rel = (void *)sechdrs[relsec].sh_addr;
 
-	pr_alert("kpm: rl[%u] enter nsymtabsect=%u infosec=%u size=%lu nrel=%lu\n",
 		 relsec, symindex, sechdrs[relsec].sh_info, sechdrs[relsec].sh_size,
 		 sechdrs[relsec].sh_size / sizeof(*rel));
 	for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rel); i++) {
 		if (i < 8 || i % 128 == 0)
-			pr_alert("kpm: rl[%u] i=%u off=%llx type=%u sym=%u\n", relsec, i,
 				 rel[i].r_offset, ELF64_R_TYPE(rel[i].r_info),
 				 ELF64_R_SYM(rel[i].r_info));
 		else if (i % 64 == 63)
-			pr_alert("kpm: rl-progress[%u] i=%u/%zu\n", relsec, i,
 				 sechdrs[relsec].sh_size / sizeof(*rel));
 		loc = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr + rel[i].r_offset;
 		if ((unsigned long)loc < (unsigned long)img->base ||
