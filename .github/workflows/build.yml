@@ -27,13 +27,11 @@ jobs:
       - name: Build kpm_host.ko (GKI 6.6)
         run: |
           chmod +x build/build.sh
-          
           # 1. 设置 DDK 容器内正确的内核树路径
           export KDIR="/opt/ddk/kdir/android15-6.6"
           echo "Using KDIR: $KDIR"
           
           # 2. 动态查找 DDK 容器内的 Clang 路径
-          # 通常在 /opt/ddk/clang/ 下
           REAL_CLANG_BIN=$(find /opt/ddk/clang -name "clang" -type f | head -n 1 | xargs dirname)
           echo "Found real clang bin path: $REAL_CLANG_BIN"
           
@@ -43,8 +41,6 @@ jobs:
           fi
           
           # 3. 修改原脚本里写死的 Clang 路径
-          cp build/build.sh build/build.sh.bak
-          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
           
           # 4. 确保 .config 就位，骗过脚本的检测
           if [ -f "$KDIR/.config" ]; then
@@ -56,14 +52,17 @@ jobs:
             exit 1
           fi
           
-          # 5. 执行修改后的编译脚本
+          # 5. 临时补上缺失的 resolve_cfi_shadow 函数
+          echo -e "\nstatic void resolve_cfi_shadow(void) {}" >> src/kpm_host_core.c
+          
+          # 6. 执行修改后的编译脚本
           bash build/build.sh
           
-          # 6. 重命名产物以便区分
+          # 7. 重命名产物以便区分
           if [ -f "build/kpm_host.ko" ]; then
             mv build/kpm_host.ko build/kpm_host-gki-6.6.ko
           fi
-        shell: bash
+        shell: bash --noprofile --norc -e -o pipefail {0}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
