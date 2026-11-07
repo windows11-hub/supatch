@@ -54,7 +54,7 @@ jobs:
           fi
           
           # 5. 临时补上缺失的 resolve_cfi_shadow 函数
-          echo -e "\nstatic void resolve_cfi_shadow(void) {}" >> src/kpm_host_core.c
+          sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
           # 6. 执行修改后的编译脚本
           bash build/build.sh
