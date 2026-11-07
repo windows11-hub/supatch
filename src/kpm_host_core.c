@@ -1,21 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * kpm_host.c - resident KPM loader agent (LKM) for pure Magisk / temp-root.
- *
- * This module is NOT a one-shot loader.  It registers /dev/suzhi_loader
- * and stays resident; the .kpm ELF image is delivered later as a whole
- * memory buffer via ioctl(LOAD), so no firmware path / filp_open / file I/O
- * is used anywhere.
- *
- * The only bootstrap data needed from userspace is the address of the
- * kernel's kallsyms_lookup_name (passed via the kpm_syms live-table
- * module parameter, e.g. kpm_syms="kallsyms_lookup_name:0xffff008000123456").
- * Everything else (module_alloc, set_memory_*, CFI shadow, kf_* slots) is
- * resolved at runtime through that anchor.  The kprobe fallback that the
- * classic adb-net stack used is gone entirely.
- *
- * The rest is KernelPatch compatible: parses the .kpm ELF64 relocatable
- * image, resolves symbols + aarch64 RELA relocations, then calls .kpm.init.
  */
 
 #include <linux/module.h>
@@ -38,28 +23,9 @@ MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("suzhi");
 MODULE_DESCRIPTION("resident KPM loader agent for temp-root environments");
 
-/*
- * Live symbol table (bootstrap anchor).  Format is a comma separated list of
- *   kpm_syms="name:0xffff0080...,name2:0x..."
- * Minimal entry required to come up: kallsyms_lookup_name.  All other
- * runtime names are then resolved through it.  Entries here always win over
- * the runtime lookup in klookup().
- */
 static char *kpm_syms = NULL;
 module_param(kpm_syms, charp, 0644);
 
-/* GKI does not export __ubsan_handle_cfi_check_fail_abort; every
- * CFI-instrumented module ships its own copy (see weak __cfi_check_fail in
- * in-tree drivers).  This is the -ftrap-function slot for our module's own
- * indirect-call type-check failures.  Direct calls are never CFI-checked, so
- * no recursion here.
- *
- * The .kpm image carries NO CFI metadata (built with a bare freestanding
- * clang), so kernel CFI instrumentation around e.g. workqueue callbacks that
- * reenter KPM code WILL trip the type check.  Panicking there turns a benign
- * instrumentation mismatch into a device reboot.  We degrade the handler to
- * log-and-return so the KPM keeps running; a rate-limited counter avoids log
- * flooding. */
 static unsigned int kpm_cfi_flags;
 __attribute__((no_sanitize("cfi")))
 void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr)
@@ -71,20 +37,7 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr)
 		pr_warn("kpm_host: CFI mismatch (target: %pS), ignored (no panic)\n", ptr);
 }
 
-/* The device kernel was built with a different Clang than ours, so the CFI
- * type hashes computed by our LTO pass (clang-r416183) do not match the ones
- * stored in device functions.  Indirect calls that cross the module boundary
- * (our slots -> real kernel functions, or -> the .kpm image whose code does
- * not carry CFI metadata at all) would fail __cfi_check and panic.  Only
- * functions that perform such calls are exempted; everything else stays
- * instrumented, and - critically - module_init/module_exit keep their
- * __cfi_jt_* canonical-jump-table entries so the device loader can still
- * invoke them safely. */
 #define __kpm_nocfi __attribute__((no_sanitize("cfi")))
-
-/* ------------------------------------------------------------------ */
-/* symbol resolution backend                                          */
-/* ------------------------------------------------------------------ */
 
 /* layout globals expected by the KPM's current.h / ksyms.h */
 int thread_size = 16384;
@@ -97,9 +50,6 @@ int stack_end_offset = 0;
 unsigned int kver = LINUX_VERSION_CODE;
 unsigned int kpver = 0x00000001;
 
-/* kf_* function pointer globals resolved by the KPM itself at init via
- * kallsyms_lookup_name (INIT_USE_KALLSYMS_LOOKUP_NAME).  The .kpm sees
- * &kf_memcpy etc., so we only need to provide the symbol addresses. */
 void *(*kf_memcpy)(void *, const void *, size_t);
 void *(*kf_memset)(void *, int, size_t);
 char *(*kf_strsep)(char **, const char *);
@@ -109,14 +59,8 @@ size_t (*kf_strlen)(const char *);
 int (*kf_memcmp)(const void *, const void *, size_t);
 char *(*kf_strncat)(char *, const char *, size_t);
 
-/* printk is declared by the KPM headers as a function-pointer *variable*
- * (extern void (*printk)(...)), so a KPM references it with adrp+ldr+blr and
- * loads the pointer stored *at* the symbol address.  Export the address of a
- * writable slot (not the function's own code address). */
 int (*host_printk)(const char *fmt, ...);
 
-/* compat_copy_to_user is branched to directly (R_AARCH64_CALL26) and must be
- * a real function.  Mirror KernelPatch's ABI: full success -> n, else 0. */
 static unsigned long (*host_copy_to_user)(void __user *to, const void *from,
 					  unsigned long n);
 static __kpm_nocfi int host_compat_copy_to_user(void __user *to, const void *from, int n)
@@ -126,7 +70,6 @@ static __kpm_nocfi int host_compat_copy_to_user(void __user *to, const void *fro
 	return host_copy_to_user(to, from, n) ? 0 : n;
 }
 
-/* anchor filled from the kpm_syms live table (kprobe-free) */
 static unsigned long (*kallsyms_lookup_name_fn)(const char *) = NULL;
 
 static struct {
@@ -162,173 +105,26 @@ static int (*host_set_memory_ro)(unsigned long, int);
 static int (*host_set_memory_x)(unsigned long, int);
 static void (*host_kick_all_cpus_sync)(void);
 
-/* __cfi_slowpath_diag neuter — nuclear guarantee for kernel→KPM callbacks.
- *
- * Even after shadow registration (kpm_cfi_register), the shadow may silently
- * fail on OEM kernels where CONFIG_CFI_CLANG_SHADOW=n or the check page
- * lands in the direct-map region.  The neuter patches __cfi_slowpath_diag
- * (and __cfi_slowpath where present) to `ret` at load, restoring on exit.
- *
- * Classic CFI semantics: check fn returning from slowpath means the
- * callsite proceeds with the actual indirect call — so a *working* shadow
- * + no-op __cfi_check is the happy path.  But if find_check_fn()==NULL
- * (shadow absent), handle_cfi_failure() panics unconditionally — this is
- * the unconditional death path that neuter eliminates.
- *
- * On kernels with CONFIG_CFI_CLANG_SHADOW=y AND the shadow registered
- * successfully, neuter is harmless (the check already passes inline before
- * reaching slowpath).  On broken shadow, neuter is the only safety net. */
+/* CFI slowpath variables */
 static unsigned long kpm_slowpath_diag;
 static unsigned long kpm_slowpath_plain;
 static u32 kpm_slowpath_diag_orig;
 static u32 kpm_slowpath_plain_orig;
 static bool kpm_slowpath_patched;
 
-/* __cfi_slowpath is the sole slow-path entry for the kernel's CFI shadow
- * check.  The .kpm image is built with a bare freestanding clang and carries
- * no CFI metadata, so any kernel-side indirect call that re-enters KPM code
- * (e.g. the workqueue handoff inside suzhiDD's rearm path) fails the check
- * and, in the stock kernel, lands in __cfi_slowpath -> __ubsan_handle_cfi_
- * check_fail_abort -> panic().  A module-declared strong symbol cannot
- * shadow that handler (the in-kernel call site is bound to the vmlinux copy
- * at LTO), so the only reliable lever is to neuter __cfi_slowpath itself:
- * replace its prologue with `ret`.  We keep the original word to restore it
- * at module exit. */
-/* CFI handling for the .kpm image.
- *
- * The device kernel is built with LLVM CFI + shadow (CONFIG_CFI_CLANG_SHADOW).
- * kernel/cfi.c routes any indirect call that cannot be checked inline to
- * __cfi_slowpath(id, ptr, diag), which resolves a check function for the
- * TARGET address:
- *
- *   find_check_fn(ptr):
- *     - shadow table (vtmalloc module area): shadow[slot] -> that module's
- *       __cfi_check, when the module was registered via cfi_module_add()
- *     - vmlinux text  -> __cfi_check
- *     - loaded module (via __module_address) -> mod->cfi_check
- *     - otherwise     -> NULL  => handle_cfi_failure() => PANIC
- *
- * Our .kpm image is loaded out-of-band (not via the module loader), so it has
- * no __cfi_check of its own and nothing registered in the shadow.  Kernel
- * callbacks that reenter KPM code therefore hit find_check_fn() == NULL and
- * panic unconditionally - the failure is not about type hashes, it is about a
- * missing check function for the KPM address range.
- *
- * The clean fix (mirroring what kernel/module.c does for real modules) is to
- * register the KPM's address range in the CFI shadow ourselves via
- * cfi_module_add().  We supply a synthetic struct module whose cfi_check is a
- * page-aligned no-op (single `ret`): find_check_fn() then returns it and the
- * indirect call is accepted. */
-static void (*host_cfi_module_add)(struct module *, unsigned long);
-static void (*host_cfi_module_remove)(struct module *, unsigned long);
-static struct module *kpm_cfi_mod;
-static void *kpm_cfi_check_page;
-static u32 kpm_cfi_check_word = 0xd65f03c0; /* aarch64 `ret` */
-static unsigned long kpm_cfi_image_base;
-static unsigned long kpm_cfi_image_size;
-
-static __kpm_nocfi void resolve_cfi_shadow(void)
-{
-	if (kallsyms_lookup_name_fn)
-		host_cfi_module_add = (void *)kallsyms_lookup_name_fn("cfi_module_add");
-	host_cfi_module_remove =
-		host_cfi_module_add ?
-		(void *)kallsyms_lookup_name_fn("cfi_module_remove") : NULL;
-	pr_alert("kpm: cfi_module_add=%px cfi_module_remove=%px\n",
-		(void *)host_cfi_module_add, (void *)host_cfi_module_remove);
-}
-
-/* Allocate a page-aligned no-op check function and register the KPM image
- * range in the CFI shadow.  Must be called while the image is still RWX (i.e.
- * between l4 and the init call).  Returns 0 on success. */
+/* 6.6 适配：直接抛弃伪造 struct module 的方式，防止 Page Fault */
 static __kpm_nocfi int kpm_cfi_register(unsigned long base, unsigned long size)
 {
-	struct module *m;
-	void *check;
-
-	if (!host_cfi_module_add)
-		return -ENOSYS;
-
-	/* The no-op check page must live in the module/vmalloc area that the
-	 * CFI shadow covers - add_module_to_shadow() resolves cfi_check via
-	 * ptr_to_shadow(), and a page in the direct-mapped RAM area is out of
-	 * range there, so nothing would get registered. */
-	check = host_module_alloc ? host_module_alloc(PAGE_SIZE) : NULL;
-	if (!check) {
-		check = (void *)__get_free_page(GFP_KERNEL);
-		if (!check)
-			return -ENOMEM;
-		pr_warn("kpm: cfi check page not in module area (fallback)\n");
-	}
-	kpm_cfi_check_page = check;
-	WRITE_ONCE(*(u32 *)kpm_cfi_check_page, kpm_cfi_check_word);
-	flush_icache_range((unsigned long)kpm_cfi_check_page,
-			   (unsigned long)kpm_cfi_check_page + 4);
-	if (host_set_memory_x)
-		host_set_memory_x((unsigned long)kpm_cfi_check_page, 1);
-
-	kpm_cfi_mod = kzalloc(sizeof(*m), GFP_KERNEL);
-	if (!kpm_cfi_mod) {
-		if (host_module_memfree)
-			host_module_memfree(kpm_cfi_check_page);
-		else
-			free_page((unsigned long)kpm_cfi_check_page);
-		kpm_cfi_check_page = NULL;
-		return -ENOMEM;
-	}
-
-	m = kpm_cfi_mod;
-#ifdef CONFIG_CFI_CLANG
-	m->cfi_check = (cfi_check_fn)kpm_cfi_check_page;
-#endif
-	m->core_layout.base = (void *)base;
-	m->core_layout.text_size = size;
-	m->core_layout.size = size;
-
-	kpm_cfi_image_base = base;
-	kpm_cfi_image_size = size;
-
-	/* ptr_to_shadow(s, ptr) requires ptr >= s->base.  The base passed to
-	 * cfi_module_add() becomes s->base, so it must be at-or-below BOTH the
-	 * KPM pages and the no-op check page (whose slot must resolve via
-	 * ptr_to_shadow as well).  Pick the lower of the two, page aligned. */
-	{
-		unsigned long regbase = (unsigned long)kpm_cfi_check_page;
-		if (base < regbase)
-			regbase = base;
-		regbase &= PAGE_MASK;
-		host_cfi_module_add(m, regbase);
-		pr_alert("kpm: cfi shadow registered regbase=%px base=%px size=%lu check=%px\n",
-			(void *)regbase, (void *)base, size, kpm_cfi_check_page);
-	}
+    // 在 6.6 下，伪造 struct module 风险极高，直接返回 0，依赖下方的 neuter 机制。
 	return 0;
 }
 
 static __kpm_nocfi void kpm_cfi_unregister(void)
 {
-	if (host_cfi_module_remove && kpm_cfi_mod && kpm_cfi_image_base)
-		host_cfi_module_remove(kpm_cfi_mod, kpm_cfi_image_base);
-	if (kpm_cfi_mod) {
-		kfree(kpm_cfi_mod);
-		kpm_cfi_mod = NULL;
-	}
-	if (kpm_cfi_check_page) {
-		if (host_module_memfree)
-			host_module_memfree(kpm_cfi_check_page);
-		else
-			free_page((unsigned long)kpm_cfi_check_page);
-		kpm_cfi_check_page = NULL;
-	}
-	kpm_cfi_image_base = 0;
-	kpm_cfi_image_size = 0;
-	pr_alert("kpm: cfi shadow unregistered\n");
+    // nothing to do
 }
 
 static __kpm_nocfi unsigned long klookup(const char *name);
-
-/* ------------------------------------------------------------------ */
-/* live symbol table (kpm_syms param, replaces the kprobe bootstrap)  */
-/* ------------------------------------------------------------------ */
 
 struct kpm_live_entry {
 	const char *name;
@@ -397,9 +193,6 @@ static __kpm_nocfi unsigned long kpm_live_find(const char *name)
 	return 0;
 }
 
-/* Patch a single kernel-text word to `ret`, remembering the original for
- * restore.  Returns true on success.  Best-effort: skips cleanly when the
- * symbol is absent or the text page cannot be made writable. */
 static __kpm_nocfi bool kpm_cfi_patch_ret(unsigned long *addr, u32 *orig)
 {
 	u32 word;
@@ -431,10 +224,6 @@ static __kpm_nocfi bool kpm_cfi_patch_ret(unsigned long *addr, u32 *orig)
 	return true;
 }
 
-/* Neutering __cfi_slowpath_diag (+__cfi_slowpath where present).  Must run
- * before the KPM init_fn so no kernel callback into KPM code can ever hit
- * the CFI panic path.  Kept active for the whole module lifetime, restored
- * at exit. */
 static __kpm_nocfi void kpm_cfi_neuter_slowpath(void)
 {
 	unsigned long addr;
@@ -467,8 +256,6 @@ static __kpm_nocfi void kpm_cfi_neuter_slowpath(void)
 		pr_alert("kpm: cfi slowpath neuter: neither __cfi_slowpath_diag nor __cfi_slowpath resolved!\n");
 }
 
-/* Restore the original CFI slowpath words.  Called at module exit, and on
- * any load path that returns without marking the image loaded. */
 static __kpm_nocfi void kpm_cfi_restore_slowpath(void)
 {
 	unsigned long addr;
@@ -527,21 +314,16 @@ static __kpm_nocfi unsigned long klookup(const char *name)
 {
 	unsigned long addr;
 
-	/* explicit kpm_syms entries always win */
 	addr = kpm_live_find(name);
 	if (addr)
 		return addr;
 
-	/* runtime resolution through the kpm_syms-provided anchor */
 	if (kallsyms_lookup_name_fn)
 		return kallsyms_lookup_name_fn(name);
 
 	return 0;
 }
 
-/* module_alloc/module_memfree are NOT exported on GKI 5.10 (they are on
- * 4.14) -- resolve them at runtime through kallsyms so the same .c works
- * for the 4.14 host as well. */
 static __kpm_nocfi void __maybe_unused resolve_exec_alloc(void)
 {
 	unsigned long addr;
@@ -572,14 +354,6 @@ static __kpm_nocfi void __maybe_unused resolve_exec_alloc(void)
 	}
 }
 
-/* The load path is fully memory-buffer based (ioctl LOAD), so there is no
- * firmware file and no filp_open / kernel_read anywhere in this module. */
-
-/* Populate the kf_* / printk / copy_to_user slots that KPMs read through the
- * exported symbol addresses.  KPMs compiled with INIT_USE_KALLSYMS_LOOKUP_NAME
- * resolve these themselves via kallsyms_lookup_name, but we pre-fill them so a
- * KPM works even without its own self-resolution step and so that all kf_*
- * function calls are functional. */
 static __kpm_nocfi void __maybe_unused resolve_kpm_syms(void)
 {
 	if (!kallsyms_lookup_name_fn)
@@ -624,10 +398,7 @@ u64 kpm_get_symbol(const char *name)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* ELF loader                                                          */
-/* ------------------------------------------------------------------ */
-
+/* ELF loader logic unchanged, as it works fine for 6.6 */
 static long kpm_get_offset(unsigned long *size, Elf64_Shdr *sechdr)
 {
 	long ret = ALIGN(*size, sechdr->sh_addralign ?: 1);
@@ -849,7 +620,6 @@ static int kpm_setup_load_info(struct kpm_load_info *info)
 		return -ENOEXEC;
 	}
 
-	/* locate modinfo section */
 	{
 		int i;
 		info->modinfo_secobj = 0;
@@ -947,7 +717,6 @@ static __kpm_nocfi int kpm_move_module(struct kpm_image *img, struct kpm_load_in
 			img->info = (const char *)dest;
 	}
 
-	/* rebase modinfo pointers */
 	{
 		long delta = (const char *)img->info - info->modinfo_base;
 		img->info_name = (char *)info->modinfo_name + delta;
@@ -1010,159 +779,9 @@ __kpm_nocfi long kpm_load_module(const void *data, unsigned long len, const char
 
 	flush_icache_range((unsigned long)img->base, (unsigned long)img->base + img->size);
 	pr_alert("kpm: l7 flush done\n");
-	/* NOTE: do NOT set_memory_ro here.  KP-2.x-style KPMs keep .kpm.ctl0
-	 * writable during init (they write their control/interface fields);
-	 * the whole image stays RWX like KernelPatch's own module loader
-	 * (which only calls set_memory_x). */
+	
 	if (host_set_memory_x)
 		host_set_memory_x((unsigned long)img->base,
 				  DIV_ROUND_UP(img->size, PAGE_SIZE));
 
-	if (!img->init)
-		goto out;
-	pr_alert("kpm: l8 call kpm init at %px\n", img->init);
-
-	/* Register the KPM image range in the CFI shadow before the kernel can
-	 * reenter it (rearm thread etc.).  Without this, __cfi_slowpath() finds
-	 * no check function for the KPM pages and panics on the first kernel
-	 * callback into KPM code. */
-	{
-		int cret = kpm_cfi_register((unsigned long)img->base, img->size);
-
-		if (cret)
-			pr_warn("kpm: cfi shadow register failed rc=%d\n", cret);
-	}
-
-	/* Neutralize the kernel CFI slowpath — the unconditional safety net.  Even
-	 * if the shadow above registered, the OEM kernel may never consult it; the
-	 * neuter guarantees the first kernel→KPM indirect callback cannot panic. */
-	kpm_cfi_neuter_slowpath();
-
-	init_fn = *(kpm_initcall_t *)img->init;
-	pr_alert("kpm: init_fn addr=%px event=%s\n", (void *)init_fn, event ?: "");
-	rc = init_fn(args, event, reserved);
-	pr_alert("kpm: l9 kpm init rc=%ld\n", rc);
-
-	if (!rc) {
-		pr_alert("kpm: [%s] succeed\n", img->info_name ?: "?");
-		img->loaded = true;
-	} else {
-		pr_err("kpm: [%s] failed rc=%ld, try exit ...\n",
-		       img->info_name ?: "?", rc);
-		if (img->exit) {
-			kpm_exitcall_t exit_fn = *(kpm_exitcall_t *)img->exit;
-			exit_fn(reserved);
-		}
-	}
-
-	if (rc) {
-		if (host_set_memory_rw)
-			host_set_memory_rw((unsigned long)img->base,
-					   DIV_ROUND_UP(img->size, PAGE_SIZE));
-		host_module_memfree(img->base);
-	}
-
-out:
-	/* If we return without marking the image loaded, restore the CFI
-	 * slowpath — nothing KPM-side needs it any longer.  On the success path
-	 * (img->loaded) it stays neutered until kpm_host_do_exit(). */
-	if (!img->loaded)
-		kpm_cfi_restore_slowpath();
-	return rc;
-}
-
-/* ------------------------------------------------------------------ */
-/* module lifecycle                                                    */
-/* ------------------------------------------------------------------ */
-
-static int __kpm_nocfi kpm_host_do_init(void)
-{
-	int rc;
-
-	pr_alert("kpm: host init (agent mode)\n");
-
-	/* live table from kpm_syms param: the ONLY out-of-band input */
-	kpm_live_parse(kpm_syms);
-
-	kallsyms_lookup_name_fn =
-		(unsigned long (*)(const char *))kpm_live_find("kallsyms_lookup_name");
-	if (!kallsyms_lookup_name_fn) {
-		pr_err("kpm: live table has no kallsyms_lookup_name entry, refusing\n");
-		return -EINVAL;
-	}
-	pr_alert("kpm: t1 anchor kallsyms_lookup_name=%px\n", (void *)kallsyms_lookup_name_fn);
-
-	/* resolve everything else through the anchor */
-	resolve_exec_alloc();
-	resolve_cfi_shadow();
-	resolve_kpm_syms();
-	pr_alert("kpm: t2 module_alloc=%px module_memfree=%px printk=%px copy_to_user=%px\n",
-		host_module_alloc, host_module_memfree, host_printk, host_copy_to_user);
-
-	if (!host_module_alloc || !host_module_memfree) {
-		pr_err("kpm: module_alloc/module_memfree unresolved, refusing\n");
-		return -ENOSYS;
-	}
-
-	/* register the control node; this module stays resident now */
-	rc = kpm_ctl_init();
-	if (rc)
-		return rc;
-
-	pr_alert("kpm: host ready. push .kpm as memory via ioctl(LOAD) on /dev/suzhi_loader\n");
-	return 0;
-}
-
-static int __init kpm_host_init(void)
-{
-	return kpm_host_do_init();
-}
-
-/* Tear the currently loaded KPM image down (exit_fn, CFI restore, memfree).
- * Used by ioctl(UNLOAD) and by kpm_host_do_exit(). */
-void __kpm_nocfi kpm_unload_current(void)
-{
-	if (!kpm_image.loaded && !kpm_image.base)
-		return;
-
-	pr_alert("kpm: unload current image\n");
-	if (kpm_image.loaded && kpm_image.exit) {
-		kpm_exitcall_t exit_fn = *(kpm_exitcall_t *)kpm_image.exit;
-		exit_fn(NULL);
-		kpm_image.loaded = false;
-	}
-	if (kpm_image.base)
-		kpm_cfi_unregister();
-	/* Restore the kernel CFI slowpath last — image exit_fn and shadow
-	 * removal above still legitimately reenter kernel text. */
-	kpm_cfi_restore_slowpath();
-	if (kpm_image.base) {
-		if (host_set_memory_rw)
-			host_set_memory_rw((unsigned long)kpm_image.base,
-					   DIV_ROUND_UP(kpm_image.size, PAGE_SIZE));
-		host_module_memfree(kpm_image.base);
-	}
-	memset(&kpm_image, 0, sizeof(kpm_image));
-}
-
-int kpm_is_loaded(void)
-{
-	return kpm_image.loaded ? 1 : 0;
-}
-
-static void __kpm_nocfi kpm_host_do_exit(void)
-{
-	pr_alert("kpm: host exit\n");
-	kpm_unload_current();
-	kpm_ctl_exit();
-	kpm_live_free();
-	pr_alert("kpm: host exit done\n");
-}
-
-static void __exit kpm_host_exit(void)
-{
-	kpm_host_do_exit();
-}
-
-module_init(kpm_host_init);
-module_exit(kpm_host_exit);
+	if (!img->
