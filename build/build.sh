@@ -26,7 +26,7 @@ grep -qx 'CONFIG_CFI_CLANG=y' "$KDIR/include/config/auto.conf" || echo "WARN: au
 echo "[*] build"
 make -C "$KDIR" "${TVARS[@]}" \
   KCFLAGS="-fsanitize-cfi-canonical-jump-tables -ffixed-x18" \
-  M="$HERE" modules
+  M="$HERE/../src" modules
 
 echo "[*] verify config still CFI"
 grep -E '^CONFIG_(CFI|LTO)' "$KDIR/.config" | grep -v '^#'
