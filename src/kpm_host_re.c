@@ -26,7 +26,6 @@ static u64 kpm_do_reloc(enum kpm_aarch64_reloc_op reloc_op, void *place, u64 val
 		return 0;
 	}
 
-	pr_err("kpm: do_reloc: unknown relocation operation %d\n", reloc_op);
 	return 0;
 }
 
@@ -46,7 +45,6 @@ static int kpm_reloc_data(enum kpm_aarch64_reloc_op op, void *place, u64 val, in
 		*(s64 *)place = sval;
 		break;
 	default:
-		pr_err("kpm: invalid length (%d) for data relocation\n", len);
 		return 0;
 	}
 
@@ -128,26 +126,16 @@ int kpm_apply_relocate_add(Elf64_Shdr *sechdrs, const char *strtab, unsigned int
 	u64 val;
 	Elf64_Rela *rel = (void *)sechdrs[relsec].sh_addr;
 
-		 relsec, symindex, sechdrs[relsec].sh_info, sechdrs[relsec].sh_size,
-		 sechdrs[relsec].sh_size / sizeof(*rel));
 	for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rel); i++) {
-		if (i < 8 || i % 128 == 0)
-				 rel[i].r_offset, ELF64_R_TYPE(rel[i].r_info),
-				 ELF64_R_SYM(rel[i].r_info));
-		else if (i % 64 == 63)
-				 sechdrs[relsec].sh_size / sizeof(*rel));
 		loc = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr + rel[i].r_offset;
 		if ((unsigned long)loc < (unsigned long)img->base ||
 		    (unsigned long)loc + 8 > (unsigned long)img->base + img->size) {
-			pr_err("kpm: reloc loc OOB: %px (base %px size %lu rel %u/%zu)\n",
-			       loc, img->base, img->size, i,
-			       sechdrs[relsec].sh_size / sizeof(*rel));
+			pr_err("kpm: reloc loc OOB\n");
 			return -ENOEXEC;
 		}
 		sym = (Elf64_Sym *)sechdrs[symindex].sh_addr + ELF64_R_SYM(rel[i].r_info);
 		if ((unsigned long)sym < (unsigned long)img->base ||
 		    (unsigned long)sym + sizeof(*sym) > (unsigned long)img->base + img->size) {
-			pr_err("kpm: reloc sym OOB: %px\n", sym);
 			return -ENOEXEC;
 		}
 		val = sym->st_value + rel[i].r_addend;
