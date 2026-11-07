@@ -2,6 +2,7 @@
 /*
  * kpm_host.c - resident KPM loader agent (LKM) for pure Magisk / temp-root.
  */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -14,25 +15,16 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/moduleloader.h>
+
 #include "kpm_host.h"
 #include "kpm_insn.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("suzhi");
 MODULE_DESCRIPTION("resident KPM loader agent for temp-root environments");
+
 static char *kpm_syms = NULL;
 module_param(kpm_syms, charp, 0644);
-
-static unsigned int kpm_cfi_flags;
-__attribute__((no_sanitize("cfi")))
-void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr)
-{
-	(void)data;
-	if (kpm_cfi_flags++)
-		pr_warn_ratelimited("kpm_host: CFI mismatch (target: %pS), ignored\n", ptr);
-	else
-		pr_warn("kpm_host: CFI mismatch (target: %pS), ignored (no panic)\n", ptr);
-}
 
 #define __kpm_nocfi __attribute__((no_sanitize("cfi")))
 
@@ -95,11 +87,11 @@ static struct {
 	{ "kf_strncat", &kf_strncat },
 };
 
-static void *(*host_module_alloc)(unsigned long);
-static void (*host_module_memfree)(void *);
+static void *(*host_vmalloc)(unsigned long);
+static void (*host_vfree)(const void *);
+static int (*host_set_memory_x)(unsigned long, int);
 static int (*host_set_memory_rw)(unsigned long, int);
 static int (*host_set_memory_ro)(unsigned long, int);
-static int (*host_set_memory_x)(unsigned long, int);
 static void (*host_kick_all_cpus_sync)(void);
 
 /* CFI slowpath variables */
@@ -108,18 +100,6 @@ static unsigned long kpm_slowpath_plain;
 static u32 kpm_slowpath_diag_orig;
 static u32 kpm_slowpath_plain_orig;
 static bool kpm_slowpath_patched;
-
-/* 6.6 适配：直接抛弃伪造 struct module 的方式，防止 Page Fault */
-static __kpm_nocfi int kpm_cfi_register(unsigned long base, unsigned long size)
-{
-    // 在 6.6 下，伪造 struct module 风险极高，直接返回 0，依赖下方的 neuter 机制。
-	return 0;
-}
-
-static __kpm_nocfi void kpm_cfi_unregister(void)
-{
-    // nothing to do
-}
 
 static __kpm_nocfi unsigned long klookup(const char *name);
 
@@ -326,12 +306,12 @@ static __kpm_nocfi void __maybe_unused resolve_exec_alloc(void)
 	unsigned long addr;
 
 	if (kallsyms_lookup_name_fn) {
-		addr = kallsyms_lookup_name_fn("module_alloc");
+		addr = kallsyms_lookup_name_fn("vmalloc");
 		if (addr)
-			host_module_alloc = (void *(*)(unsigned long))addr;
-		addr = kallsyms_lookup_name_fn("module_memfree");
+			host_vmalloc = (void *(*)(unsigned long))addr;
+		addr = kallsyms_lookup_name_fn("vfree");
 		if (addr)
-			host_module_memfree = (void (*)(void *))addr;
+			host_vfree = (void (*)(const void *))addr;
 		addr = kallsyms_lookup_name_fn("set_memory_rw");
 		if (addr)
 			host_set_memory_rw = (int (*)(unsigned long, int))addr;
@@ -395,7 +375,7 @@ u64 kpm_get_symbol(const char *name)
 	return 0;
 }
 
-/* ELF loader logic unchanged, as it works fine for 6.6 */
+/* ELF loader logic */
 static long kpm_get_offset(unsigned long *size, Elf64_Shdr *sechdr)
 {
 	long ret = ALIGN(*size, sechdr->sh_addralign ?: 1);
@@ -673,13 +653,13 @@ static __kpm_nocfi int kpm_move_module(struct kpm_image *img, struct kpm_load_in
 {
 	int i;
 
-	if (!host_module_alloc) {
-		pr_err("kpm: module_alloc unresolved\n");
+	if (!host_vmalloc) {
+		pr_err("kpm: vmalloc unresolved\n");
 		return -ENOENT;
 	}
-	img->base = host_module_alloc(img->size);
+	img->base = host_vmalloc(img->size);
 	if (!img->base) {
-		pr_err("kpm: module_alloc failed, need %lu bytes\n", img->size);
+		pr_err("kpm: vmalloc failed, need %lu bytes\n", img->size);
 		return -ENOMEM;
 	}
 	if (host_set_memory_rw)
@@ -785,12 +765,6 @@ __kpm_nocfi long kpm_load_module(const void *data, unsigned long len, const char
 		goto out;
 	pr_alert("kpm: l8 call kpm init at %px\n", img->init);
 
-	{
-		int cret = kpm_cfi_register((unsigned long)img->base, img->size);
-		if (cret)
-			pr_warn("kpm: cfi shadow register failed rc=%d\n", cret);
-	}
-
 	kpm_cfi_neuter_slowpath();
 
 	init_fn = *(kpm_initcall_t *)img->init;
@@ -814,7 +788,8 @@ __kpm_nocfi long kpm_load_module(const void *data, unsigned long len, const char
 		if (host_set_memory_rw)
 			host_set_memory_rw((unsigned long)img->base,
 					   DIV_ROUND_UP(img->size, PAGE_SIZE));
-		host_module_memfree(img->base);
+		if (host_vfree)
+			host_vfree(img->base);
 	}
 
 out:
@@ -823,10 +798,7 @@ out:
 	return rc;
 }
 
-/* ------------------------------------------------------------------ */
-/* module lifecycle                                                    */
-/* ------------------------------------------------------------------ */
-
+/* module lifecycle */
 static int __kpm_nocfi kpm_host_do_init(void)
 {
 	int rc;
@@ -844,13 +816,12 @@ static int __kpm_nocfi kpm_host_do_init(void)
 	pr_alert("kpm: t1 anchor kallsyms_lookup_name=%px\n", (void *)kallsyms_lookup_name_fn);
 
 	resolve_exec_alloc();
-	resolve_cfi_shadow();
 	resolve_kpm_syms();
-	pr_alert("kpm: t2 module_alloc=%px module_memfree=%px printk=%px copy_to_user=%px\n",
-		host_module_alloc, host_module_memfree, host_printk, host_copy_to_user);
+	pr_alert("kpm: t2 vmalloc=%px vfree=%px printk=%px copy_to_user=%px\n",
+		host_vmalloc, host_vfree, host_printk, host_copy_to_user);
 
-	if (!host_module_alloc || !host_module_memfree) {
-		pr_err("kpm: module_alloc/module_memfree unresolved, refusing\n");
+	if (!host_vmalloc) {
+		pr_err("kpm: vmalloc unresolved, refusing\n");
 		return -ENOSYS;
 	}
 
@@ -878,14 +849,13 @@ void __kpm_nocfi kpm_unload_current(void)
 		exit_fn(NULL);
 		kpm_image.loaded = false;
 	}
-	if (kpm_image.base)
-		kpm_cfi_unregister();
 	kpm_cfi_restore_slowpath();
 	if (kpm_image.base) {
 		if (host_set_memory_rw)
 			host_set_memory_rw((unsigned long)kpm_image.base,
 					   DIV_ROUND_UP(kpm_image.size, PAGE_SIZE));
-		host_module_memfree(kpm_image.base);
+		if (host_vfree)
+			host_vfree(kpm_image.base);
 	}
 	memset(&kpm_image, 0, sizeof(kpm_image));
 }
