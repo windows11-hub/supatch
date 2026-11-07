@@ -1,4 +1,4 @@
-name: Build KPM Host Agent
+name: Build and Verify KPM Host
 
 on:
   push:
@@ -7,61 +7,62 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-lkm:
-    name: Build kpm_host.ko (GKI 6.6)
+  build:
     runs-on: ubuntu-latest
     container:
-      # 核心：抄 YukiZygisk 的作业，使用完整版 ddk 镜像，并锁定 20260828 版本
       image: ghcr.io/ylarod/ddk:android15-6.6-20260828
       options: --privileged
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Build kpm_host
+      - name: Build and Verify
         shell: bash
         run: |
           set -e
-          echo "Environment KDIR: ${KDIR:-<empty>}"
+          echo "=> KDIR: $KDIR"
           
-          if [ -z "${KDIR:-}" ] || [ ! -d "$KDIR" ]; then
-            export KDIR=$(find /opt/ddk -maxdepth 4 -type d -name "android15-6.6" 2>/dev/null | head -n 1)
-            echo "Fallback KDIR: $KDIR"
-          fi
-          
-          if [ -z "$KDIR" ] || [ ! -f "$KDIR/Makefile" ]; then
-            echo "ERROR: KDIR is still unavailable."
-            exit 1
-          fi
-
-          chmod +x build/build.sh
-          cp build/build.sh build/build.sh.bak
-          
-          # 1. 直接注释掉原本写死的 B=...，让 PATH 保持镜像默认
-          sed -i 's|^B=.*|# B=path_removed_by_ci|' build/build.sh
-          
-          # 2. 修正源码路径
-          sed -i 's|M="$HERE"|M="$HERE/../src"|g' build/build.sh
-          
-          # 3. 关闭会报错的新版 CFI 参数，关掉格式警告
-          sed -i 's|-fsanitize-cfi-canonical-jump-tables||g' build/build.sh
-          sed -i 's|KCFLAGS="-ffixed-x18"|KCFLAGS="-ffixed-x18 -Wno-format"|g' build/build.sh
-          
-          # 4. 删除 6.6 下不支持的 resolve_cfi_shadow 调用
+          # 移除 6.6 内核下不支持的函数调用
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
           
-          # 5. 关键修复：由于注释了 B，build.sh 里的 CC="$B/clang" 会变成 /clang，这里用 sed 把脚本里所有的 "$B/" 替换掉
-          sed -i 's|\$B/||g' build/build.sh
-          
-          # 执行编译
-          bash build/build.sh || true
-          
+          echo "=> Compiling module..."
+          make -C "$KDIR" \
+            M="$PWD/src" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            KCFLAGS="-ffixed-x18 -Wno-format" \
+            modules
+            
+          echo "=> Handling output..."
+          mkdir -p build
           if [ -f "src/kpm_host.ko" ]; then
             mv src/kpm_host.ko build/kpm_host-gki-6.6.ko
-            echo "=== Successfully built build/kpm_host-gki-6.6.ko ==="
-            ls -lh build/kpm_host-gki-6.6.ko
+            echo "=> Moved to build/kpm_host-gki-6.6.ko"
           else
-            echo "ERROR: src/kpm_host.ko not found!"
+            echo "=> ERROR: kpm_host.ko not found in src/"
             exit 1
           fi
+          
+          echo ""
+          echo "=================================================="
+          echo "                 LKM VERIFICATION"
+          echo "=================================================="
+          echo "Vermagic:"
+          modinfo -F vermagic build/kpm_host-gki-6.6.ko
+          echo ""
+          echo "Sections (.modinfo and .versions):"
+          readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
+          echo ""
+          echo "SHA256:"
+          sha256sum build/kpm_host-gki-6.6.ko
+          echo "=================================================="
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpm_host-gki-6.6
+          path: build/kpm_host-gki-6.6.ko
+          if-no-files-found: error
