@@ -27,24 +27,43 @@ jobs:
       - name: Build kpm_host.ko (GKI 6.6)
         run: |
           chmod +x build/build.sh
-          # 将 DDK 的内核源码路径传入脚本
-          # 注意：具体 KDIR 路径可能需要根据 DDK 镜像内部的实际情况微调
-          # 常见的 GKI 源码路径通常在 /lib/modules/$(uname -r)/build 或者 /ddk/kernel
-          export KDIR="/ddk/kernel"
-          if [ ! -d "$KDIR" ]; then
-            echo "Warning: $KDIR not found. Trying alternative path."
-            export KDIR=$(find / -name "Makefile" -path "*/linux-*" | head -n 1 | xargs dirname)
-          fi
+          
+          # 1. 设置 DDK 容器内正确的内核树路径
+          export KDIR="/opt/ddk/kdir/android15-6.6"
           echo "Using KDIR: $KDIR"
           
-          # 执行编译脚本，假设产物输出在 build/ 目录
-          # 如果脚本需要特定参数，请根据实际情况调整
+          # 2. 动态查找 DDK 容器内的 Clang 路径
+          # 通常在 /opt/ddk/clang/ 下
+          REAL_CLANG_BIN=$(find /opt/ddk/clang -name "clang" -type f | head -n 1 | xargs dirname)
+          echo "Found real clang bin path: $REAL_CLANG_BIN"
+          
+          if [ -z "$REAL_CLANG_BIN" ]; then
+            echo "ERROR: Could not find clang in /opt/ddk"
+            exit 1
+          fi
+          
+          # 3. 修改原脚本里写死的 Clang 路径
+          cp build/build.sh build/build.sh.bak
+          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
+          
+          # 4. 确保 .config 就位，骗过脚本的检测
+          if [ -f "$KDIR/.config" ]; then
+            mkdir -p /root/kernel_common
+            cp "$KDIR/.config" /root/kernel_common/.config
+            echo "Config copied from $KDIR/.config"
+          else
+            echo "ERROR: .config not found in $KDIR"
+            exit 1
+          fi
+          
+          # 5. 执行修改后的编译脚本
           bash build/build.sh
           
-          # 防止脚本命名不带 6.6，强制重命名以便区分
+          # 6. 重命名产物以便区分
           if [ -f "build/kpm_host.ko" ]; then
             mv build/kpm_host.ko build/kpm_host-gki-6.6.ko
           fi
+        shell: bash
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
