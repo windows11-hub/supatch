@@ -14,14 +14,13 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/moduleloader.h>
-MODULE_INFO(vermagic, "6.6.118-android15-11 SMP preempt mod_unload modversions aarch64");
 #include "kpm_host.h"
 #include "kpm_insn.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("suzhi");
 MODULE_DESCRIPTION("resident KPM loader agent for temp-root environments");
-
+MODULE_INFO(vermagic, "6.6.118-android15-11 SMP preempt mod_unload modversions aarch64");
 static char *kpm_syms = NULL;
 module_param(kpm_syms, charp, 0644);
 
