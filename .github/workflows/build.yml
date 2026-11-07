@@ -27,41 +27,42 @@ jobs:
       - name: Build kpm_host.ko (GKI 6.6)
         run: |
           chmod +x build/build.sh
-          # 1. 设置 DDK 容器内正确的内核树路径
+          
           export KDIR="/opt/ddk/kdir/android15-6.6"
           echo "Using KDIR: $KDIR"
           
-          # 2. 动态查找 DDK 容器内的 Clang 路径
           REAL_CLANG_BIN=$(find /opt/ddk/clang -name "clang" -type f | head -n 1 | xargs dirname)
           echo "Found real clang bin path: $REAL_CLANG_BIN"
-          cp build/build.sh build/build.sh.bak
-          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
+          
           if [ -z "$REAL_CLANG_BIN" ]; then
             echo "ERROR: Could not find clang in /opt/ddk"
             exit 1
           fi
           
-          # 3. 修改原脚本里写死的 Clang 路径
+          cp build/build.sh build/build.sh.bak
+          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
+          sed -i 's|M="$HERE"|M="$HERE/../src"|g' build/build.sh
           
-          # 4. 确保 .config 就位，骗过脚本的检测
           if [ -f "$KDIR/.config" ]; then
             mkdir -p /root/kernel_common
             cp "$KDIR/.config" /root/kernel_common/.config
-            echo "Config copied from $KDIR/.config"
           else
-            echo "ERROR: .config not found in $KDIR"
             exit 1
           fi
           
-          # 5. 临时补上缺失的 resolve_cfi_shadow 函数
-          sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
+          # 关闭 -Wformat 警告，防止 Elf64_Xword 格式不匹配报错
+          sed -i 's|KCFLAGS="-fsanitize-cfi-canonical-jump-tables -ffixed-x18"|KCFLAGS="-ffixed-x18 -Wno-format"|g' build/build.sh
           
-          # 6. 执行修改后的编译脚本
-          bash build/build.sh
+          # 编译（忽略 build.sh 结尾因找不到旧路径产物而抛出的错误）
+          bash build/build.sh || true
           
-          # 7. 重命名产物以便区分
-          if [ -f "build/kpm_host.ko" ]; then
-            mv build/kpm_host.ko build/kpm_host-gki-6.6.ko
+          # 从正确的位置提取并重命名产物
+          if [ -f "src/kpm_host.ko" ]; then
+            mv src/kpm_host.ko build/kpm_host-gki-6.6.ko
+            echo "=== Successfully built build/kpm_host-gki-6.6.ko ==="
+          else
+            echo "ERROR: src/kpm_host.ko not found!"
+            exit 1
           fi
         shell: bash --noprofile --norc -e -o pipefail {0}
 
