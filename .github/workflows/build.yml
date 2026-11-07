@@ -25,10 +25,8 @@ jobs:
           set -e
           echo "Environment KDIR: ${KDIR:-<empty>}"
           
-          # 如果完整版镜像没有自动设置 KDIR，这里做个兜底探测
           if [ -z "${KDIR:-}" ] || [ ! -d "$KDIR" ]; then
-            echo "KDIR not set by image, searching..."
-            export KDIR=$(find /opt/ddk /root -maxdepth 4 -type d -name "kernel_common" -o -name "android15-6.6" 2>/dev/null | head -n 1)
+            export KDIR=$(find /opt/ddk -maxdepth 4 -type d -name "android15-6.6" 2>/dev/null | head -n 1)
             echo "Fallback KDIR: $KDIR"
           fi
           
@@ -38,21 +36,12 @@ jobs:
           fi
 
           chmod +x build/build.sh
-          
-          # 修改 build.sh 以适应容器环境
           cp build/build.sh build/build.sh.bak
           
-          # 1. 修正 Clang 路径（完整版镜像里一般在 /usr/bin 或通过环境变量调用）
-          # 探测 DDK 镜像里真实的 LLVM 工具链路径
-          REAL_CLANG_BIN=$(find / -name "llvm-objcopy" -type f 2>/dev/null | head -n 1 | xargs dirname)
-          echo "Found LLVM tools at: $REAL_CLANG_BIN"
-          if [ -z "$REAL_CLANG_BIN" ]; then
-            echo "ERROR: llvm-objcopy not found!"
-            exit 1
-          fi
-          sed -i "s|B=/root/prebuilt_clang/clang-r416183/bin|B=$REAL_CLANG_BIN|g" build/build.sh
+          # 1. 直接注释掉原本写死的 B=...，让 PATH 保持镜像默认
+          sed -i 's|^B=.*|# B=path_removed_by_ci|' build/build.sh
           
-          # 2. 修正源码路径（源码在 src/ 目录下）
+          # 2. 修正源码路径
           sed -i 's|M="$HERE"|M="$HERE/../src"|g' build/build.sh
           
           # 3. 关闭会报错的新版 CFI 参数，关掉格式警告
@@ -61,11 +50,13 @@ jobs:
           
           # 4. 删除 6.6 下不支持的 resolve_cfi_shadow 调用
           sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
-
+          
+          # 5. 关键修复：由于注释了 B，build.sh 里的 CC="$B/clang" 会变成 /clang，这里用 sed 把脚本里所有的 "$B/" 替换掉
+          sed -i 's|\$B/||g' build/build.sh
+          
           # 执行编译
           bash build/build.sh || true
           
-          # 产物重命名并移入 build 目录
           if [ -f "src/kpm_host.ko" ]; then
             mv src/kpm_host.ko build/kpm_host-gki-6.6.ko
             echo "=== Successfully built build/kpm_host-gki-6.6.ko ==="
@@ -74,10 +65,3 @@ jobs:
             echo "ERROR: src/kpm_host.ko not found!"
             exit 1
           fi
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kpm_host-gki-6.6
-          path: build/kpm_host-gki-6.6.ko
-          if-no-files-found: error
