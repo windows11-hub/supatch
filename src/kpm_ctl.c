@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * kpm_ctl.c - resident KPM loader agent control node.
- *
- * Provides /dev/suzhi_loader with ioctl(LOAD/UNLOAD/STATUS). The actual
- * KPM ELF image is handed to the kernel as a whole memory buffer
- * (copy_from_user -> vmalloc), so no firmware file nor filp_open/kernel_read
- * is required anywhere on the load path.
- *
- * Method: open() is gated on capable(CAP_SYS_MODULE). Serialization between
- * load/unload is done with a mutex. While a KPM image is resident the module
- * holds a reference on itself so rmmod fails with -EBUSY (and thus never
- * tears the loaded image down underneath the agent).
  */
-
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -27,7 +16,6 @@
 #include "kpm_host.h"
 
 #define KPM_CTL_VERSION 1
-
 #define KPM_CTL_IOCTL_BASE 'S'
 #define SUZHI_LOADER_LOAD   _IOW(KPM_CTL_IOCTL_BASE, 1, struct kpm_ctl_load)
 #define SUZHI_LOADER_UNLOAD _IO(KPM_CTL_IOCTL_BASE, 2)
@@ -103,8 +91,6 @@ static long kpm_ctl_load(struct kpm_ctl_load __user *uarg)
 	if (rc)
 		goto out;
 
-	if (!try_module_get(THIS_MODULE))
-		pr_err("kpm: ctl: failed to hold module ref, rmmod while loaded!\n");
 	rc = 0;
 out:
 	mutex_unlock(&kpm_ctl_lock);
@@ -121,7 +107,6 @@ static long kpm_ctl_unload(void)
 		return -EINVAL;
 	}
 	kpm_unload_current();
-	module_put(THIS_MODULE);
 	mutex_unlock(&kpm_ctl_lock);
 	return rc;
 }
@@ -161,7 +146,7 @@ static long kpm_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long uar
 }
 
 static const struct file_operations kpm_ctl_fops = {
-	.owner = THIS_MODULE,
+	/* 删掉 .owner = THIS_MODULE; 解除 struct module 强依赖 */
 	.open = kpm_ctl_open,
 	.release = kpm_ctl_release,
 	.unlocked_ioctl = kpm_ctl_ioctl,
