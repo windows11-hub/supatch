@@ -47,50 +47,53 @@ jobs:
             exit 1
           fi
 
-          # 4. 用 echo 生成 Python 脚本（每行独立，绝无缩进错误）
-          echo "import sys" > /tmp/patch_ko.py
-          echo "ko_path = 'build/kpm_host-gki-6.6.ko'" >> /tmp/patch_ko.py
-          echo "with open(ko_path, 'rb') as f:" >> /tmp/patch_ko.py
-          echo "    data = f.read()" >> /tmp/patch_ko.py
-          echo "old_vers = [" >> /tmp/patch_ko.py
-          echo "    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64'," >> /tmp/patch_ko.py
-          echo "    b'6.6.127 SMP preempt mod_unload modversions aarch64'" >> /tmp/patch_ko.py
-          echo "]" >> /tmp/patch_ko.py
-          echo "new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'" >> /tmp/patch_ko.py
-          echo "patched = False" >> /tmp/patch_ko.py
-          echo "for old_str in old_vers:" >> /tmp/patch_ko.py
-          echo "    if old_str in data:" >> /tmp/patch_ko.py
-          echo "        pad_len = len(old_str) - len(new_str)" >> /tmp/patch_ko.py
-          echo "        replace_str = new_str + (b'\x00' * pad_len)" >> /tmp/patch_ko.py
-          echo "        data = data.replace(old_str, replace_str)" >> /tmp/patch_ko.py
-          echo "        patched = True" >> /tmp/patch_ko.py
-          echo "        print('==> Patched string: ' + old_str.decode())" >> /tmp/patch_ko.py
-          echo "if patched:" >> /tmp/patch_ko.py
-          echo "    with open(ko_path, 'wb') as f:" >> /tmp/patch_ko.py
-          echo "        f.write(data)" >> /tmp/patch_ko.py
-          echo "    print('==> Successfully patched file.')" >> /tmp/patch_ko.py
-          echo "else:" >> /tmp/patch_ko.py
-          echo "    print('==> Warning: old vermagic not found.')" >> /tmp/patch_ko.py
-
-          # 5. 手动执行 Python 脚本
+          # 4. 二进制强改 Vermagic
           echo "=> Patching binary vermagic..."
-          python3 /tmp/patch_ko.py
+          cat << 'EOF' > patch_vermagic.py
+import sys
 
-          # 6. 输出体检信息
+ko_path = 'build/kpm_host-gki-6.6.ko'
+with open(ko_path, 'rb') as f:
+    data = f.read()
+
+old_strs = [
+    b'6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64',
+    b'6.6.127 SMP preempt mod_unload modversions aarch64'
+]
+new_str = b'6.6.118-android15-11 SMP preempt mod_unload modversions aarch64'
+
+for old_str in old_strs:
+    if old_str in data:
+        pad_len = len(old_str) - len(new_str)
+        patched_str = new_str + b'\x00' * pad_len
+        data = data.replace(old_str, patched_str)
+        print(f'==> Replaced old vermagic: {old_str.decode()}')
+
+with open(ko_path, 'wb') as f:
+    f.write(data)
+EOF
+          
+          python3 patch_vermagic.py
+
+          # 5. 输出体检信息
           echo ""
           echo "=================================================="
           echo "                 LKM VERIFICATION"
           echo "=================================================="
           echo "Vermagic:"
           modinfo -F vermagic build/kpm_host-gki-6.6.ko
-          echo ""
-          echo "Sections:"
+          
+          echo -e "\n=== CHECK: Modversions & Sections ==="
           readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
-          echo ""
-          echo "SHA256:"
+          
+          echo -e "\n=== CHECK: Undefined Symbols (Required by Kernel) ==="
+          # 提取出模块需要内核提供的未定义符号
+          readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}'
+          
+          echo -e "\n=== CHECK: SHA256 ==="
           sha256sum build/kpm_host-gki-6.6.ko
           echo "=================================================="
-
+          
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
