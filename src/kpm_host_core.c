@@ -59,7 +59,7 @@ static __kpm_nocfi int host_compat_copy_to_user(void __user *to, const void *fro
 	return host_copy_to_user(to, from, n) ? 0 : n;
 }
 
-static unsigned long (*kallsyms_lookup_name_fn)(const char *) = NULL;
+extern unsigned long kallsyms_lookup_name(const char *);
 
 static struct {
 	const char *name;
