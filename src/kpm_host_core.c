@@ -45,7 +45,6 @@ static int (*host_misc_deregister)(void *) = NULL;
 static unsigned long (*host_copy_to_user)(void *, const void *, unsigned long) = NULL;
 static unsigned long (*host_copy_from_user)(void *, const void *, unsigned long) = NULL;
 static int (*host_capable)(int) = NULL;
-static long (*host_sscanf)(const char *, const char *, ...) = NULL;
 static char *(*host_strcpy)(char *, const char *) = NULL;
 static int (*host_strcmp)(const char *, const char *) = NULL;
 static int (*host_strncmp)(const char *, const char *, size_t) = NULL;
@@ -66,9 +65,6 @@ static void (*host_kfree)(const void *) = NULL;
 static void *(*host_module_put)(void *) = NULL;
 static int (*host_try_module_get)(void *) = NULL;
 static int (*host_printk_fn)(const char *, ...) = NULL;
-
-/* Mutex — raw spinlock because DEFINE_MUTEX would need mutex_init/kernel linkage */
-static int host_mutex_locked = 0;
 
 #define kpm_lock()   do { if (!host_capable) return -ENOSYS; } while (0)
 #define kpm_unlock() do { } while (0)
