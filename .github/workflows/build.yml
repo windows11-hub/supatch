@@ -76,30 +76,38 @@ jobs:
           python3 /tmp/patch_ko.py
 
           # 4. 交叉编译用户态 helper（suzhi_loader）
+          #    容器是 Android DDK，它的 clang 是 NDK 工具链，必须用
+          #    --target=aarch64-linux-android<api>（自带 sysroot）编译，
+          #    而非 --target=aarch64-linux-gnu（找不到 aarch64 glibc 会报 asm/errno.h）。
           echo ""
           echo "=> Compiling userspace helper suzhi_loader..."
-          # 尝试多种 arm64 交叉编译器；容器里有 clang（编内核用的）。
-          # suzhi_loader.c 只用标准 libc,适合 -static 编成可在设备上直接跑的 arm64 可执行文件。
           SLOADER_SRC="helper/suzhi_loader.c"
           SLOADER_OUT="build/suzhi_loader_arm64"
-          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            aarch64-linux-gnu-gcc -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC"
-          elif command -v aarch64-linux-gnu-clang >/dev/null 2>&1; then
-            aarch64-linux-gnu-clang -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC"
-          elif command -v clang >/dev/null 2>&1; then
-            # 用 clang 的 --target 指定 aarch64-linux-gnu（需有对应 sysroot/库）
-            # -static 若因缺 sysroot 失败，回退到默认可执行（设备端仍需 glibc）。
-            clang -O2 --target=aarch64-linux-gnu -static -o "$SLOADER_OUT" "$SLOADER_SRC" 2>/dev/null \
-              || clang -O2 --target=aarch64-linux-gnu -o "$SLOADER_OUT" "$SLOADER_SRC" \
-              || echo "=> WARN: clang aarch64 helper compile failed"
-          else
-            echo "=> WARN: no arm64 cross-compiler available; skipping suzhi_loader binary."
+          build_ok=0
+          # (a) 显式 TC（可传 /path/to/clang）
+          if [ -n "$TC" ] && command -v "$TC" >/dev/null 2>&1; then
+            "$TC" -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
           fi
-          if [ -f "$SLOADER_OUT" ]; then
+          # (b) Android NDK 风格的 clang（.androidroot 等环境，或命令行 clang --target）
+          if [ "$build_ok" -eq 0 ] && command -v clang >/dev/null 2>&1; then
+            clang -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
+          fi
+          # (c) 通用 aarch64-linux-gnu 三件套
+          if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            aarch64-linux-gnu-gcc -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
+          fi
+          # (d) aarch64-linux-android 前缀（NDK 自带的 clang/gcc）
+          if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-android21-clang >/dev/null 2>&1; then
+            aarch64-linux-android21-clang -O2 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
+          fi
+          if [ "$build_ok" -eq 0 ]; then
+            echo "=> WARN: could not cross-compile suzhi_loader with available toolchain."
+            echo "    Try setting repository/action variable TC=/path/to/aarch64-lowlevel clang."
+            echo "    (helper must be built separately if CI can not - it does not block the .ko)"
+          else
             echo "=> helper compiled ok:"
             ls -l "$SLOADER_OUT"
-          else
-            echo "=> WARN: helper binary not produced (device helper must be built separately)."
+            file "$SLOADER_OUT" 2>/dev/null || true
           fi
           # 5. 输出体检信息（含未定义符号硬校验）
           echo ""
@@ -129,7 +137,43 @@ jobs:
           readelf -rW build/kpm_host-gki-6.6.ko 2>/dev/null \
             | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name" \
             | head -50 || echo "  (no RELOC entries match)"
-          echo "  --- undef full ---"
+          # 3) 把上述重定位的 文件内偏移 归属到对应函数（用于定位泄漏内联）
+          python3 - <<'EOF'
+import subprocess, re
+def symbols():
+    out = subprocess.check_output(
+        ["readelf","-sW","build/kpm_host-gki-6.6.ko"], text=True, errors="ignore")
+    syms=[]
+    for ln in out.splitlines():
+        m=re.match(r'\s*(\d+):\s+([0-9a-fA-F]+)\s+(\d+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\.?\S+)\s*(.*)', ln)
+        if m:
+            val=int(m.group(2),16); size=int(m.group(3),16)
+            nm=(m.group(8) or "").strip()
+            sec=m.group(7)
+            syms.append((val,size,nm,sec))
+    return syms
+def reloc_targets():
+    out = subprocess.check_output(
+        ["readelf","-rW","build/kpm_host-gki-6.6.ko"], text=True, errors="ignore")
+    hits=[]
+    for ln in out.splitlines():
+        if 'system_cpucaps' in ln or 'alt_cb_patch_nops' in ln:
+            m=re.match(r'\s*([0-9a-fA-F]+)\s', ln)
+            if m: hits.append((''.join(ln.split()).split('system_cpucaps') if 'system_cpucaps' in ln else '', int(m.group(1),16), ln.strip()))
+    # simpler: collect offset + symbol
+    res=[]
+    for ln in out.splitlines():
+        m=re.match(r'\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+\S+\s+([0-9a-fA-F]+)?\s*(system_cpucaps|alt_cb_patch_nops)\s', ln)
+        if m: res.append((int(m.group(1),16), m.group(3)))
+    return res
+syms=symbols()
+for off,name in reloc_targets():
+    owner=None
+    for val,size,nm,sec in syms:
+        if sec.startswith('.text') and nm and val<=off<val+size and size>0:
+            owner=nm; break
+    print(f"  reloc@{off:#x} -> {name}  owner=<{owner or '?'}>")
+EOF          echo "  --- undef full ---"
           readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
             | awk '$7 == "UND" && $8 != "" {print}'
           echo -e "\n=== CHECK: Non-exported anchor/patch symbols (must be ABSENT) ==="
