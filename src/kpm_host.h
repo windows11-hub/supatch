@@ -74,6 +74,7 @@ void kpm_ctl_exit(void);
 
 /* live symbol table (bootstrap anchor from userspace, replaces kprobe) */
 #define KPM_LIVE_MAX 64
+#define KPM_LIVE_NAME_MAX 128
 
 /* kpm_host_re.c */
 int kpm_apply_relocate_add(Elf64_Shdr *sechdrs, const char *strtab, unsigned int symindex, unsigned int relsec,
