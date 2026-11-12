@@ -22,11 +22,12 @@ jobs:
         run: |
           set -e
           echo "=> KDIR: $KDIR"
-          
-          # 1. 移除源码里不支持的 6.6 CFI 调用
-          sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
-          
-          # 2. 编译模块
+
+          # 1. 编译模块
+          #    - 源码已按"裸 finit_module + 活表"路线重写:
+          #      kallsyms_lookup_name / flush_icache_range 等非导出依赖已全部改为
+          #      kpm_syms 活表解析的函数指针(见 kpm_host_core.c),因此这里不再需要
+          #      任何 sed 去删除不支持的调用(旧的 resolve_cfi_shadow() 已不存在)。
           echo "=> Compiling module..."
           make -C "$KDIR" \
             M="$PWD/src" \
@@ -34,10 +35,10 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             CC=clang \
-            KCFLAGS="-ffixed-x18 -Wno-format" \
+            KCFLAGS="-ffixed-x18 -Wno-format -Werror" \
             modules
 
-          # 3. 处理产物
+          # 2. 处理产物
           echo "=> Handling output..."
           mkdir -p build
           if [ -f "src/kpm_host.ko" ]; then
@@ -47,7 +48,7 @@ jobs:
             exit 1
           fi
 
-          # 4. 用 echo 逐行生成 Python 脚本修补 vermagic
+          # 3. 用 echo 逐行生成 Python 脚本修补 vermagic
           echo "ko_path = 'build/kpm_host-gki-6.6.ko'" > /tmp/patch_ko.py
           echo "with open(ko_path, 'rb') as f:" >> /tmp/patch_ko.py
           echo "    data = f.read()" >> /tmp/patch_ko.py
@@ -74,21 +75,68 @@ jobs:
           echo "=> Patching binary vermagic..."
           python3 /tmp/patch_ko.py
 
-          # 5. 输出体检信息（含未定义符号检查）
+          # 4. 交叉编译用户态 helper（suzhi_loader）
+          echo ""
+          echo "=> Compiling userspace helper suzhi_loader..."
+          # 尝试多种 arm64 交叉编译器；容器里有 clang（编内核用的）。
+          # suzhi_loader.c 只用标准 libc,适合 -static 编成可在设备上直接跑的 arm64 可执行文件。
+          SLOADER_SRC="helper/suzhi_loader.c"
+          SLOADER_OUT="build/suzhi_loader_arm64"
+          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            aarch64-linux-gnu-gcc -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC"
+          elif command -v aarch64-linux-gnu-clang >/dev/null 2>&1; then
+            aarch64-linux-gnu-clang -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC"
+          elif command -v clang >/dev/null 2>&1; then
+            # 用 clang 的 --target 指定 aarch64-linux-gnu（需有对应 sysroot/库）
+            # -static 若因缺 sysroot 失败，回退到默认可执行（设备端仍需 glibc）。
+            clang -O2 --target=aarch64-linux-gnu -static -o "$SLOADER_OUT" "$SLOADER_SRC" 2>/dev/null \
+              || clang -O2 --target=aarch64-linux-gnu -o "$SLOADER_OUT" "$SLOADER_SRC" \
+              || echo "=> WARN: clang aarch64 helper compile failed"
+          else
+            echo "=> WARN: no arm64 cross-compiler available; skipping suzhi_loader binary."
+          fi
+          if [ -f "$SLOADER_OUT" ]; then
+            echo "=> helper compiled ok:"
+            ls -l "$SLOADER_OUT"
+          else
+            echo "=> WARN: helper binary not produced (device helper must be built separately)."
+          fi
+          # 5. 输出体检信息（含未定义符号硬校验）
           echo ""
           echo "=================================================="
           echo "                 LKM VERIFICATION"
           echo "=================================================="
           echo "Vermagic:"
           modinfo -F vermagic build/kpm_host-gki-6.6.ko
-          
+
           echo -e "\n=== CHECK: Modversions & Sections ==="
           readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
-          
+
           echo -e "\n=== CHECK: Undefined Symbols (Required by Kernel) ==="
           # 提取出模块需要内核提供的未定义符号
-          readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}'
-          
+          UNDEF=$(readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}')
+          echo "$UNDEF"
+
+          # ---- 黑名单符号硬校验 ----
+          # 以下是 GKI 不导出、且裸 finit_module 无法满足的符号。若它们仍出现在
+          # UNDEF 清单里,说明活表化没有生效,加载必然失败,直接让 CI 失败。
+          echo -e "\n=== CHECK: Non-exported anchor/patch symbols (must be ABSENT) ==="
+          BAD=0
+          for s in kallsyms_lookup_name caches_clean_inv_pou system_cpucaps alt_cb_patch_nops; do
+            if echo "$UNDEF" | grep -qx "$s"; then
+              echo "  FAIL: '$s' still an undefined (non-exported) dependency!"
+              BAD=1
+            else
+              echo "  ok  : '$s' absent from UNDEF"
+            fi
+          done
+          if [ "$BAD" -ne 0 ]; then
+            echo "==> ERROR: module still has non-exported UNDEF; it cannot be loaded via plain finit_module."
+            echo "    Re-run the bare-magisk (kpm_syms live-table) port or check resolve_all()/suzhi_loader need[] list."
+            exit 1
+          fi
+          echo "==> PASS: no non-exported anchor dependencies."
+
           echo -e "\n=== CHECK: SHA256 ==="
           sha256sum build/kpm_host-gki-6.6.ko
           echo "=================================================="
@@ -96,5 +144,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kpm_host-gki-6.6
-          path: build/kpm_host-gki-6.6.ko
+          path: |
+            build/kpm_host-gki-6.6.ko
+            build/suzhi_loader_arm64
           if-no-files-found: error
