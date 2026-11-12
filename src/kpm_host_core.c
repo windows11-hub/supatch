@@ -26,6 +26,16 @@ module_param(kpm_syms, charp, 0644);
 
 #define __kpm_nocfi __attribute__((no_sanitize("cfi")))
 
+/* Fallback defines (kept here so the file still builds even if kpm_host.h
+ * in the repo is not updated in lockstep). */
+#ifndef KPM_LIVE_MAX
+#define KPM_LIVE_MAX 64
+#endif
+#ifndef KPM_LIVE_NAME_MAX
+#define KPM_LIVE_NAME_MAX 128
+#endif
+
+
 /* ============================================================
  * ALL kernel APIs resolved through kallsyms — ZERO direct calls
  * ============================================================ */
