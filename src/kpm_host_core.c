@@ -30,10 +30,13 @@ module_param(kpm_syms, charp, 0644);
  * ALL kernel APIs resolved through kallsyms — ZERO direct calls
  * ============================================================ */
 
-/* kallsyms_lookup_name as a true UNDEF symbol — resolved by KernelSU's
- * load_module_with_resolver (KSU_IOCTL_LOOKUP_SYMBOLS) at insmod time.
- * This removes the kpm_syms module-param bootstrap requirement. */
-extern unsigned long kallsyms_lookup_name(const char *name);
+/* ALL kernel resolving now goes through the userspace-supplied live table
+ * (kpm_syms module param).  ZERO direct kernel calls: even
+ * kallsyms_lookup_name and flush_icache_range are resolved as pointers,
+ * because on GKI (5.7+) these are NOT exported and a plain finit_module
+ * cannot satisfy them — only a resolver kernel (KernelSU/APatch) could,
+ * and this build targets bare magisk temp-root. */
+static void (*host_flush_icache_range)(unsigned long, unsigned long) = NULL;
 static void *(*host_vmalloc)(unsigned long) = NULL;
 static void (*host_vfree)(const void *) = NULL;
 static int (*host_set_memory_x)(unsigned long, int) = NULL;
@@ -102,68 +105,100 @@ static u32 kpm_slowpath_diag_orig;
 static u32 kpm_slowpath_plain_orig;
 static bool kpm_slowpath_patched;
 
-/* ---- live symbol table (bootstrap from userspace via kpm_syms param) ---- */
+/* ---- live symbol table (bootstrap from userspace via kpm_syms param) ----
+ * Fully self-contained: parsed and matched with hand-rolled helpers, so we
+ * don't depend on ANY kernel/compiler string function or host_* pointer
+ * (which would create a chicken-and-egg loop with resolve_all). The name is
+ * stored inline (no kstrdup), so no kfree on teardown either. */
 
 struct kpm_live_entry {
-	const char *name;
+	char name[KPM_LIVE_NAME_MAX];
 	unsigned long addr;
 };
 
 static struct kpm_live_entry kpm_live[KPM_LIVE_MAX];
 static unsigned int kpm_live_n;
 
+static int kpm_str_eq(const char *a, const char *b)
+{
+	while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+	return *a == *b;
+}
+
+/* parse one hex uint from 's' at the first token; returns 0 on bad char */
+static unsigned long kpm_hex_parse(const char *s)
+{
+	unsigned long v = 0;
+	if (s[0]=='0' && (s[1]=='x' || s[1]=='X')) s += 2;
+	while (*s) {
+		char c = *s;
+		unsigned int d;
+		if (c >= '0' && c <= '9') d = c - '0';
+		else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+		else return 0;
+		v = (v << 4) | d;
+		s++;
+	}
+	return v;
+}
+
 static __kpm_nocfi unsigned long kpm_live_find(const char *name)
 {
-	for (unsigned int i = 0; i < kpm_live_n; i++) {
-		if (kpm_live[i].name && host_strcmp && host_strcmp(kpm_live[i].name, name) == 0)
+	for (unsigned int i = 0; i < kpm_live_n; i++)
+		if (kpm_live[i].name[0] && kpm_str_eq(kpm_live[i].name, name))
 			return kpm_live[i].addr;
-	}
 	return 0;
 }
 
+/* format: name:0xHEX,name2:0xHEX2,... (addresses are the userspace-supplied
+ * /proc/kallsyms values). Names are copied inline. */
 static __kpm_nocfi void kpm_live_parse(char *str)
 {
-	if (!str || !host_strchr || !host_sscanf_fn || !host_kstrdup)
-		return;
+	kpm_live_n = 0;
+	if (!str) return;
 
 	char *p = str;
 	unsigned int n = 0;
 
 	while (p && *p && n < KPM_LIVE_MAX) {
-		char *comma = host_strchr(p, ',');
-		char *colon = host_strchr(p, ':');
-		if (!colon || (comma && colon > comma))
-			break;
+		char *colon = p;
+		while (*colon && (*colon != ':') && (*colon != ',')) colon++;
+		if (*colon == ',') { p = colon + 1; continue; }
+		if (*colon != ':') break;
 		unsigned long namelen = colon - p;
-		if (namelen == 0 || namelen >= 128)
-			break;
-		char name[128];
-		host_memcpy(name, p, namelen);
-		name[namelen] = '\0';
-		unsigned long long tmp;
-		if (host_sscanf_fn(colon + 1, "%llx", &tmp) != 1) {
-			p = comma ? comma + 1 : NULL;
+		if (namelen == 0 || namelen >= KPM_LIVE_NAME_MAX) break;
+
+		char *addr = colon + 1;
+		char *comma = addr;
+		while (*comma && *comma != ',') comma++;
+		char saved = *comma;
+		*comma = '\0';
+		unsigned long av = kpm_hex_parse(addr);
+		*comma = saved;
+		if (!av) {
+			if (!saved) break;
+			p = comma + 1;
 			continue;
 		}
-		if (!tmp) {
-			p = comma ? comma + 1 : NULL;
-			continue;
-		}
-		kpm_live[n].name = host_kstrdup(name, 0); /* GFP_KERNEL=0? */
-		kpm_live[n].addr = (unsigned long)tmp;
+
+		for (unsigned int j = 0; j < namelen; j++)
+			kpm_live[n].name[j] = p[j];
+		kpm_live[n].name[namelen] = '\0';
+		kpm_live[n].addr = av;
 		n++;
-		p = comma ? comma + 1 : NULL;
+		if (!saved) break;
+		p = comma + 1;
 	}
 	kpm_live_n = n;
 }
 
 static void kpm_live_free(void)
 {
-	if (!host_kfree) return;
-	for (unsigned int i = 0; i < kpm_live_n; i++)
-		if (kpm_live[i].name) { host_kfree(kpm_live[i].name); kpm_live[i].name = NULL; }
+	/* names stored inline — nothing to free */
 	kpm_live_n = 0;
 }
+
 
 /* ---- kallsyms lookup ---- */
 
@@ -171,7 +206,7 @@ static __kpm_nocfi unsigned long klookup(const char *name)
 {
 	unsigned long addr = kpm_live_find(name);
 	if (addr) return addr;
-	return kallsyms_lookup_name(name);
+	/* live-table only; no kallsyms fallback (GKI does not export it) */
 	return 0;
 }
 
@@ -188,6 +223,7 @@ static __kpm_nocfi void resolve_all(void)
 	RESOLVE(set_memory_rw);
 	RESOLVE(set_memory_ro);
 	RESOLVE(kick_all_cpus_sync);
+	RESOLVE(flush_icache_range);
 	RESOLVE(misc_register);
 	RESOLVE(misc_deregister);
 	RESOLVE(copy_to_user);
@@ -230,7 +266,7 @@ static __kpm_nocfi bool kpm_cfi_patch_ret(unsigned long *addr, u32 *orig)
 	if (rc) { kpm_pr_alert("kpm: cfi rw fail %px rc=%d\n", (void *)*addr, rc); return false; }
 	*orig = word;
 	WRITE_ONCE(*(u32 *)*addr, 0xd65f03c0);
-	flush_icache_range(*addr, *addr + 4);
+	host_flush_icache_range(*addr, *addr + 4);
 	if (host_kick_all_cpus_sync) host_kick_all_cpus_sync();
 	if (host_set_memory_ro) host_set_memory_ro(*addr & PAGE_MASK, 1);
 	kpm_pr_alert("kpm: cfi neutered %px\n", (void *)*addr);
@@ -243,7 +279,7 @@ static __kpm_nocfi void kpm_cfi_restore_one(unsigned long addr, u32 orig)
 	int rc = host_set_memory_rw(addr & PAGE_MASK, 1);
 	if (rc) return;
 	WRITE_ONCE(*(u32 *)addr, orig);
-	flush_icache_range(addr, addr + 4);
+	host_flush_icache_range(addr, addr + 4);
 	if (host_kick_all_cpus_sync) host_kick_all_cpus_sync();
 	if (host_set_memory_ro) host_set_memory_ro(addr & PAGE_MASK, 1);
 }
@@ -559,7 +595,7 @@ __kpm_nocfi long kpm_load_module(const void *data, unsigned long len, const char
 	if ((rc = kpm_apply_relocations(img, &info))) goto out;
 	kpm_pr_alert("kpm: l6 reloc ok\n");
 
-	flush_icache_range((unsigned long)img->base, (unsigned long)img->base + img->size);
+	host_flush_icache_range((unsigned long)img->base, (unsigned long)img->base + img->size);
 	if (host_set_memory_x) host_set_memory_x((unsigned long)img->base, DIV_ROUND_UP(img->size, PAGE_SIZE));
 
 	if (!img->init) goto out;
