@@ -10,7 +10,6 @@
 #include <linux/string.h>
 #include <linux/err.h>
 #include <linux/slab.h>
-#include <asm/cacheflush.h>
 #include <linux/elf.h>
 #include <linux/version.h>
 
