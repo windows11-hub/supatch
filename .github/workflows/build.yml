@@ -20,14 +20,7 @@ jobs:
       - name: Build and Verify
         shell: bash
         run: |
-          set -e
-          echo "=> KDIR: $KDIR"
-
           # 1. 编译模块
-          #    - 源码已按"裸 finit_module + 活表"路线重写:
-          #      kallsyms_lookup_name / flush_icache_range 等非导出依赖已全部改为
-          #      kpm_syms 活表解析的函数指针(见 kpm_host_core.c),因此这里不再需要
-          #      任何 sed 去删除不支持的调用(旧的 resolve_cfi_shadow() 已不存在)。
           echo "=> Compiling module..."
           make -C "$KDIR" \
             M="$PWD/src" \
@@ -37,7 +30,7 @@ jobs:
             CC=clang \
             KCFLAGS="-ffixed-x18 -Wno-format -Werror" \
             modules
-
+          
           # 2. 处理产物
           echo "=> Handling output..."
           mkdir -p build
@@ -47,8 +40,8 @@ jobs:
             echo "=> ERROR: kpm_host.ko not found in src/"
             exit 1
           fi
-
-          # 3. 用 echo 逐行生成 Python 脚本修补 vermagic
+          
+          # 3. patch vermagic (生成 python 脚本逐行 echo，避免 heredoc 问题)
           echo "ko_path = 'build/kpm_host-gki-6.6.ko'" > /tmp/patch_ko.py
           echo "with open(ko_path, 'rb') as f:" >> /tmp/patch_ko.py
           echo "    data = f.read()" >> /tmp/patch_ko.py
@@ -71,44 +64,33 @@ jobs:
           echo "    print('==> Successfully patched file.')" >> /tmp/patch_ko.py
           echo "else:" >> /tmp/patch_ko.py
           echo "    print('==> Warning: old vermagic not found.')" >> /tmp/patch_ko.py
-
           echo "=> Patching binary vermagic..."
           python3 /tmp/patch_ko.py
-
+          
           # 4. 交叉编译用户态 helper（suzhi_loader）
-          #    容器是 Android DDK，它的 clang 是 NDK 工具链，必须用
-          #    --target=aarch64-linux-android<api>（自带 sysroot）编译，
-          #    而非 --target=aarch64-linux-gnu（找不到 aarch64 glibc 会报 asm/errno.h）。
           echo ""
           echo "=> Compiling userspace helper suzhi_loader..."
           SLOADER_SRC="helper/suzhi_loader.c"
           SLOADER_OUT="build/suzhi_loader_arm64"
           build_ok=0
-          # (a) 显式 TC（可传 /path/to/clang）
           if [ -n "$TC" ] && command -v "$TC" >/dev/null 2>&1; then
             "$TC" -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
           fi
-          # (b) Android NDK 风格的 clang（.androidroot 等环境，或命令行 clang --target）
           if [ "$build_ok" -eq 0 ] && command -v clang >/dev/null 2>&1; then
             clang -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
           fi
-          # (c) 通用 aarch64-linux-gnu 三件套
           if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
             aarch64-linux-gnu-gcc -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
           fi
-          # (d) aarch64-linux-android 前缀（NDK 自带的 clang/gcc）
           if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-android21-clang >/dev/null 2>&1; then
             aarch64-linux-android21-clang -O2 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
           fi
           if [ "$build_ok" -eq 0 ]; then
-            echo "=> WARN: could not cross-compile suzhi_loader with available toolchain."
-            echo "    Try setting repository/action variable TC=/path/to/aarch64-lowlevel clang."
-            echo "    (helper must be built separately if CI can not - it does not block the .ko)"
+            echo "=> WARN: could not cross-compile suzhi_loader (not required for .ko)."
           else
-            echo "=> helper compiled ok:"
-            ls -l "$SLOADER_OUT"
-            file "$SLOADER_OUT" 2>/dev/null || true
+            echo "=> helper compiled ok:"; ls -l "$SLOADER_OUT"; file "$SLOADER_OUT" 2>/dev/null || true
           fi
+          
           # 5. 输出体检信息（含未定义符号硬校验）
           echo ""
           echo "=================================================="
@@ -116,66 +98,25 @@ jobs:
           echo "=================================================="
           echo "Vermagic:"
           modinfo -F vermagic build/kpm_host-gki-6.6.ko
-
+          
           echo -e "\n=== CHECK: Modversions & Sections ==="
           readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
-
+          
           echo -e "\n=== CHECK: Undefined Symbols (Required by Kernel) ==="
-          # 提取出模块需要内核提供的未定义符号
           UNDEF=$(readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}')
           echo "$UNDEF"
-
-          # ---- 黑名单符号硬校验 ----
-          # 以下是 GKI 不导出、且裸 finit_module 无法满足的符号。若它们仍出现在
-          # UNDEF 清单里,说明活表化没有生效,加载必然失败,直接让 CI 失败。
-          # 定位残留符号的引用来源（哪个重定位节/地址引用了它们）
+          
+          # 残留非导出符号定位：符号表中这些符号的类型/绑定 + 重定位来源
           echo -e "\n=== CHECK: Relocation sources for flagged symbols ==="
           readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
             | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name| mutex_lock$| mutex_unlock$" \
             | head -50
-          echo "  --- reloc ---"
+          echo "  --- reloc (which section/offset references them) ---"
           readelf -rW build/kpm_host-gki-6.6.ko 2>/dev/null \
             | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name" \
             | head -50 || echo "  (no RELOC entries match)"
-          # 3) 把上述重定位的 文件内偏移 归属到对应函数（用于定位泄漏内联）
-          python3 - <<'EOF'
-import subprocess, re
-def symbols():
-    out = subprocess.check_output(
-        ["readelf","-sW","build/kpm_host-gki-6.6.ko"], text=True, errors="ignore")
-    syms=[]
-    for ln in out.splitlines():
-        m=re.match(r'\s*(\d+):\s+([0-9a-fA-F]+)\s+(\d+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\w+)\s+(\.?\S+)\s*(.*)', ln)
-        if m:
-            val=int(m.group(2),16); size=int(m.group(3),16)
-            nm=(m.group(8) or "").strip()
-            sec=m.group(7)
-            syms.append((val,size,nm,sec))
-    return syms
-def reloc_targets():
-    out = subprocess.check_output(
-        ["readelf","-rW","build/kpm_host-gki-6.6.ko"], text=True, errors="ignore")
-    hits=[]
-    for ln in out.splitlines():
-        if 'system_cpucaps' in ln or 'alt_cb_patch_nops' in ln:
-            m=re.match(r'\s*([0-9a-fA-F]+)\s', ln)
-            if m: hits.append((''.join(ln.split()).split('system_cpucaps') if 'system_cpucaps' in ln else '', int(m.group(1),16), ln.strip()))
-    # simpler: collect offset + symbol
-    res=[]
-    for ln in out.splitlines():
-        m=re.match(r'\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+\S+\s+([0-9a-fA-F]+)?\s*(system_cpucaps|alt_cb_patch_nops)\s', ln)
-        if m: res.append((int(m.group(1),16), m.group(3)))
-    return res
-syms=symbols()
-for off,name in reloc_targets():
-    owner=None
-    for val,size,nm,sec in syms:
-        if sec.startswith('.text') and nm and val<=off<val+size and size>0:
-            owner=nm; break
-    print(f"  reloc@{off:#x} -> {name}  owner=<{owner or '?'}>")
-EOF          echo "  --- undef full ---"
-          readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
-            | awk '$7 == "UND" && $8 != "" {print}'
+          
+          # 黑名单符号硬校验（WARN 不中断，便于继续出包定位）
           echo -e "\n=== CHECK: Non-exported anchor/patch symbols (must be ABSENT) ==="
           BAD=0
           for s in kallsyms_lookup_name caches_clean_inv_pou system_cpucaps alt_cb_patch_nops; do
@@ -188,16 +129,20 @@ EOF          echo "  --- undef full ---"
           done
           if [ "$BAD" -ne 0 ]; then
             echo "==> WARN: module has residual non-exported UNDEF above."
-            echo "    They are real referenced symbols; some may be resolveable via kpm_syms live-table"
-            echo "    (if present in kallsyms), but if they are hard compile-time refs loading will fail."
-            echo "    Inspect the relocation sources above to decide: host_*-pointerify or accept kallsyms."
+            echo "    Inspect relocation sources above to find who references them."
           else
             echo "==> PASS: no non-exported anchor dependencies."
           fi
-
+          
+          # 完整 UNDEF 清单（人工核对）
+          echo -e "\n=== CHECK: Undefined symbols (full) ==="
+          readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
+            | awk '$7 == "UND" && $8 != "" {print}'
+          
           echo -e "\n=== CHECK: SHA256 ==="
           sha256sum build/kpm_host-gki-6.6.ko
           echo "=================================================="
+          
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
