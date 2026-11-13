@@ -67,29 +67,11 @@ jobs:
           echo "=> Patching binary vermagic..."
           python3 /tmp/patch_ko.py
           
-          # 4. 交叉编译用户态 helper（suzhi_loader）
+          # 4. 用户态 helper（suzhi_loader）
+          #    这个 DDK 容器只带内核构建用的 clang，没有 aarch64 用户态 libc，
+          #    因此**不在这里编**；由下面的 helper(ARM64) job 在原生 arm64 runner 上编译。
           echo ""
-          echo "=> Compiling userspace helper suzhi_loader..."
-          SLOADER_SRC="helper/suzhi_loader.c"
-          SLOADER_OUT="build/suzhi_loader_arm64"
-          build_ok=0
-          if [ -n "$TC" ] && command -v "$TC" >/dev/null 2>&1; then
-            "$TC" -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
-          fi
-          if [ "$build_ok" -eq 0 ] && command -v clang >/dev/null 2>&1; then
-            clang -O2 --target=aarch64-linux-android21 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
-          fi
-          if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            aarch64-linux-gnu-gcc -O2 -static -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
-          fi
-          if [ "$build_ok" -eq 0 ] && command -v aarch64-linux-android21-clang >/dev/null 2>&1; then
-            aarch64-linux-android21-clang -O2 -o "$SLOADER_OUT" "$SLOADER_SRC" && build_ok=1
-          fi
-          if [ "$build_ok" -eq 0 ]; then
-            echo "=> WARN: could not cross-compile suzhi_loader (not required for .ko)."
-          else
-            echo "=> helper compiled ok:"; ls -l "$SLOADER_OUT"; file "$SLOADER_OUT" 2>/dev/null || true
-          fi
+          echo "=> helper 由独立 job (ubuntu-24.04-arm) 原生编译，本 job 只产出 .ko"
           
           # 5. 输出体检信息（含未定义符号硬校验）
           echo ""
@@ -147,7 +129,27 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kpm_host-gki-6.6
-          path: |
-            build/kpm_host-gki-6.6.ko
-            build/suzhi_loader_arm64
+          path: build/kpm_host-gki-6.6.ko
+          if-no-files-found: error
+
+  helper:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build suzhi_loader (native aarch64)
+        shell: bash
+        run: |
+          set -e
+          echo "=> host arch: $(uname -m)"
+          gcc -O2 -static -o build_suzhi_loader_arm64 helper/suzhi_loader.c
+          ls -l build_suzhi_loader_arm64
+          file build_suzhi_loader_arm64 || true
+
+      - name: Upload helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: suzhi_loader-arm64
+          path: build_suzhi_loader_arm64
           if-no-files-found: error
