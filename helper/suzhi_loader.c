@@ -3,7 +3,7 @@
  * suzhi_loader.c - userspace driver for the resident /dev/suzhi_loader agent.
  *
  * Usage (run on the device as root):
-  "  %s load <kpm_host.ko> [<suzhi_NQ.kpm>] [kpm_args...]  (kpm optional; agent-only if omitted)\n"
+ *   suzhi_loader load <kpm_host.ko> [<suzhi_NQ.kpm>] [kpm_args...]
  *       -- pushes kpm_host.ko with kpm_syms="kallsyms_lookup_name:0x<addr>",
  *          then hands the .kpm to the agent as ONE memory buffer via
  *          ioctl(LOAD). kpm_args (space separated) are forwarded verbatim
@@ -103,6 +103,7 @@ static unsigned long ksym_lookup(const char *want)
 		if (sscanf(line, "%lx %c %255s", &a, &type, name) != 3)
 			continue;
 		if (strcmp(name, want) == 0) {
+			addr = a;
 			if (!a)
 				fprintf(stderr,
 					"[!] '%s' found but address is 0 (kptr_restrict>0?)\n",
