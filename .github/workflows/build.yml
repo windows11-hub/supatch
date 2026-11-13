@@ -82,21 +82,36 @@ jobs:
           modinfo -F vermagic build/kpm_host-gki-6.6.ko
           
           echo -e "\n=== CHECK: Modversions & Sections ==="
-          readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
+          VER_MAGIC=$(modinfo -F vermagic build/kpm_host-gki-6.6.ko)
+          SECS=$(readelf -SW build/kpm_host-gki-6.6.ko 2>/dev/null)
+          echo "$SECS" | grep -E "modinfo|__versions" || true
+          
+          # CRC check: vermagic claims modversions, so a __versions section must exist.
+          # A CONFIG_MODVERSIONS kernel rejects a CRC-less module with ENOENT (os error 2).
+          case "$VER_MAGIC" in
+            *modversions*)
+              if echo "$SECS" | grep -q "__versions"; then
+                echo "==> CRC: __versions present (ok)"
+              else
+                echo "==> CRC: __versions ABSENT but vermagic says modversions"
+                echo "    Target kernel will reject this ko with ENOENT (os error 2)."
+                echo "    Build against the device kernel tree with CONFIG_MODVERSIONS=y"
+                echo "    and keep the CRCs it emits; hand-patching vermagic alone is not enough."
+              fi
+              ;;
+            *)
+              echo "==> CRC: vermagic has no modversions token, __versions not required"
+              ;;
+          esac
+          
           
           echo -e "\n=== CHECK: Undefined Symbols (Required by Kernel) ==="
           UNDEF=$(readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}')
           echo "$UNDEF"
           
-          # 残留非导出符号定位：符号表中这些符号的类型/绑定 + 重定位来源
-          echo -e "\n=== CHECK: Relocation sources for flagged symbols ==="
-          readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
-            | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name| mutex_lock$| mutex_unlock$" \
-            | head -50
-          echo "  --- reloc (which section/offset references them) ---"
-          readelf -rW build/kpm_host-gki-6.6.ko 2>/dev/null \
-            | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name" \
-            | head -50 || echo "  (no RELOC entries match)"
+          # 残留非导出符号定位：把每处重定位归属到具体函数，并检查 CRC/.versions 段
+          echo -e "\n=== CHECK: Relocation sources / owning function ==="
+          python3 tools/reloc_owner.py build/kpm_host-gki-6.6.ko
           
           # 黑名单符号硬校验（WARN 不中断，便于继续出包定位）
           echo -e "\n=== CHECK: Non-exported anchor/patch symbols (must be ABSENT) ==="
