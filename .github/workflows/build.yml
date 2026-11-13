@@ -104,14 +104,24 @@ jobs:
               ;;
           esac
           
-          
           echo -e "\n=== CHECK: Undefined Symbols (Required by Kernel) ==="
           UNDEF=$(readelf -s build/kpm_host-gki-6.6.ko | awk '$7 == "UND" && $8 != "" {print $8}')
           echo "$UNDEF"
           
-          # 残留非导出符号定位：把每处重定位归属到具体函数，并检查 CRC/.versions 段
-          echo -e "\n=== CHECK: Relocation sources / owning function ==="
-          python3 tools/reloc_owner.py build/kpm_host-gki-6.6.ko
+          # 残留非导出符号定位：列出引用它们的重定位，并检查模块自带段
+          echo -e "\n=== CHECK: Relocation sources for flagged symbols ==="
+          readelf -rW build/kpm_host-gki-6.6.ko 2>/dev/null \
+            | grep -Ei "system_cpucaps|alt_cb_patch_nops|caches_clean_inv_pou|kick_all_cpus_sync|kallsyms_lookup_name" \
+            | head -40 || echo "  (none)"
+          
+          echo "  --- .altinstructions / .altinstr_replacement sections ---"
+          # (SECS 已在上面取得)
+          echo "$SECS" | grep -E "altinstructions|altinstr_replacement" || echo "  (absent)"
+          
+          # 我们自己的 kpm_* 符号若成了 UNDEF，说明仓库里的 src/ 不全或未参与链接
+          echo "  --- our own kpm_* symbols left UNDEF ---"
+          readelf -sW build/kpm_host-gki-6.6.ko 2>/dev/null \
+            | awk '$7=="UND" && $8 ~ /^kpm_/' | sed 's/^/  /' || true
           
           # 黑名单符号硬校验（WARN 不中断，便于继续出包定位）
           echo -e "\n=== CHECK: Non-exported anchor/patch symbols (must be ABSENT) ==="
